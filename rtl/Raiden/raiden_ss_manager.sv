@@ -34,6 +34,7 @@ module raiden_ss_manager (
 	input  wire ss_load,        // pulse da savestate_ui
 	input  wire paused_safe,    // pausa frame-aligned effettiva (dal top)
 	input  wire ss_busy,        // save_state_data.busy (DMA in corso)
+	input  wire slot_empty,     // 1 = il load ha trovato uno slot MAI SCRITTO
 
 	output reg  ss_pause,       // richiesta pausa (va in OR nel paused_safe del top)
 	output reg  write_start,    // → save_state_data.write_start (pulse)
@@ -89,12 +90,19 @@ always @(posedge clk) begin
 			S_RUN: begin
 				// DMA in corso: mantieni la pausa finché busy è alto
 				if (~ss_busy) begin
-					if (is_load) begin
+					if (is_load && !slot_empty) begin
 						// LOAD finito: TUTTE le RAM sono coerenti. Ora (e SOLO ora)
 						// resetto le CPU perché ricarichino i registri da SS_CPU.
 						ss_cpu_reload <= 1'b1;
 						reload_cnt    <= 5'd0;
 						state         <= S_RELOAD;
+					end else if (is_load) begin
+						// SLOT VUOTO: memory_stream non ha scritto NIENTE nelle RAM.
+						// Resettare le CPU qui significherebbe ripartire con lo stato
+						// corrente a meta' — e' il caricamento a vuoto che rompeva il
+						// gioco. Si sblocca e basta: la partita prosegue intatta.
+						ss_pause <= 1'b0;
+						state    <= S_IDLE;
 					end else begin
 						ss_pause <= 1'b0;   // SAVE finito → sblocca subito
 						state    <= S_IDLE;

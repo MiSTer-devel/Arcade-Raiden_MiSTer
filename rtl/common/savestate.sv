@@ -4,11 +4,11 @@
 /*  This file is part of Raiden_MiSTer.
     GPL-3.
     Original author: Martin Donlon (wickerwaka) — Arcade-TaitoF2 savestate system.
-    Modified/adapted for BoogieWings by: Umberto Parisi (rmonc79)
+    Modified/adapted for Raiden by: Umberto Parisi (rmonic79)
 */
 
 //============================================================================
-//  BoogieWings Savestate — core bus (ssbus)
+//  Raiden Savestate — core bus (ssbus)
 //
 //  Portato dal sistema savestate di Martin Donlon (wickerwaka) Arcade-TaitoF2.
 //  Riferimento: _reference/taitof2_ss/savestates.sv
@@ -125,10 +125,12 @@ endmodule
 // Wrappa un registro/segnale di N bit, esponendolo sul ssbus in parole da 16 bit.
 // save: il master legge tutte le parole. load: le riscrive e alza bits_wr (pulse)
 // quando ha finito, così il modulo target ricarica bits_out.
-// Base DDR3 per i 4 slot savestate (2MB/slot). Deve coincidere con la base dichiarata
-// nel CONF_STR "SS<base>:<size>". Per BoogieWings la DDR3 del core è a 0x30000000; gli
-// slot SS vanno in una zona ALTA non usata dalle ROM tile. 0x3E000000 = come Taito F2.
-// (lo stato reale è ~150KB << 2MB/slot).
+// Base DDR3 delle 4 REGIONI savestate (2MB l'una), che il firmware vede come i
+// suoi 4 slot: dentro ognuna stanno 8 sotto-slot, per 32 slot totali (vedi il
+// blocco piu' avanti). Deve coincidere con la base dichiarata nel CONF_STR
+// "SS<base>:<size>". Gli slot SS vanno in una zona ALTA della DDR3, non usata
+// dalle ROM tile: 0x3E000000. Lo stato reale e' ~62KB (misurato sui file .ss)
+// contro i 224KB di ogni sotto-slot.
 `ifndef SS_DDR_BASE_DEF
 `ifdef VERILATOR
 `define SS_DDR_BASE_DEF 32'h00000000
@@ -148,17 +150,109 @@ module save_state_data #(parameter COUNT = 16)(
 
     input        read_start,
     input        write_start,
-    input  [1:0] index,
+    input  [4:0] index,        // 32 slot: [4:3]=regione (file .ss1-.ss4), [2:0]=sotto-slot
     output       busy,
+    output       slot_empty,   // [FIX slot vuoto] load su sotto-slot mai scritto
 
     ssbus_if.master ssbus
 );
+
+// [32 SLOT] Il firmware Main gestisce SOLO 4 slot da ss_size: process_ss
+// (user_io.cpp) polla ogni ~1s i change-counter a base+i*ss_size (i=0..3),
+// scrive .ss1-.ss4 quando cambiano e al boot ricarica i file in DDR.
+// Per avere 32 slot persistenti con un Main stock: 8 sotto-slot per regione.
+// Layout regione (2MB):
+//   +0x00           : header regione Main-facing {size_words[63:32], cnt[31:0]}
+//   +0x10 + k*0x38000: sotto-slot k=0..7 (immagine memory_stream autonoma,
+//                      header proprio + stato ~62KB dentro 224KB)
+// Save slot N: memory_stream scrive il sotto-slot; poi il mini-FSM sotto
+// aggiorna l'header regione (cnt+1, size=0x70002 words = payload impacchettato
+// da +8 a fine sotto-slot 7) -> il Main scrive il file con TUTTI e 8 i
+// sotto-slot dentro. Load: lettura diretta del sotto-slot (i file sono gia'
+// in DDR dal boot). NB: 8*0x38000 = 4*0x70000 = 0x1C0000, quindi l'ingombro e
+// la costante dell'header sono gli stessi di quando i sotto-slot erano 4.
+// Per tornare a 4 slot semplici: start_addr = base + index*0x200000.
+wire [31:0] region_base = `SS_DDR_BASE_DEF + ({30'd0, index[4:3]} * 32'h00200000);
+// 8 sotto-slot da 0x38000 (224KB) invece di 4 da 0x70000: stesso ingombro
+// totale (8*0x38000 = 4*0x70000 = 0x1C0000), quindi l'header di regione resta
+// identico (size 0x70002 word), ma gli slot diventano 32. Lo stato reale e'
+// ~64-80KB: margine ~3x.
+wire [31:0] sub_addr    = region_base + 32'h00000010 + ({29'd0, index[2:0]} * 32'h00038000);
+
+// ddr interno per memory_stream; mux sotto verso il ddr reale (mai attivi
+// insieme: il FSM header parte solo a stream concluso, busy resta alto).
+ddr_if ms_ddr();
+wire ms_busy;
+
+localparam H_IDLE=3'd0, H_RD=3'd1, H_RD_WAIT=3'd2, H_WR=3'd3, H_WR_WAIT=3'd4;
+reg [2:0]  hstate = H_IDLE;
+reg        hdr_pend = 0, saw_busy = 0;
+reg [31:0] hdr_base;
+reg [31:0] hdr_cnt;
+reg        h_acquire = 0, h_read = 0, h_write = 0;
+reg [31:0] h_addr;
+reg [63:0] h_wdata;
+wire       hdr_active = (hstate != H_IDLE);
+
+always @(posedge clk) begin
+    if (reset) begin
+        hstate <= H_IDLE; hdr_pend <= 0; saw_busy <= 0;
+        h_acquire <= 0; h_read <= 0; h_write <= 0;
+    end else begin
+        if (write_start) begin
+            hdr_pend <= 1; saw_busy <= 0; hdr_base <= region_base;
+        end
+        if (hdr_pend && ms_busy) saw_busy <= 1;
+        case (hstate)
+            H_IDLE: if (hdr_pend && saw_busy && !ms_busy) begin
+                hdr_pend  <= 0;
+                h_acquire <= 1;
+                hstate    <= H_RD;
+            end
+            H_RD: if (!ddr.busy) begin
+                h_read <= 1; h_addr <= hdr_base;
+                hstate <= H_RD_WAIT;
+            end
+            H_RD_WAIT: if (!ddr.busy) begin
+                h_read <= 0;
+                if (ddr.rdata_ready) begin
+                    hdr_cnt <= ddr.rdata[31:0];
+                    hstate  <= H_WR;
+                end
+            end
+            H_WR: if (!ddr.busy) begin
+                h_write <= 1; h_addr <= hdr_base;
+                h_wdata <= {32'h00070002, hdr_cnt + 32'd1};
+                hstate  <= H_WR_WAIT;
+            end
+            H_WR_WAIT: if (!ddr.busy) begin
+                h_write <= 0; h_acquire <= 0;
+                hstate  <= H_IDLE;
+            end
+            default: hstate <= H_IDLE;
+        endcase
+    end
+end
+
+// mux verso il ddr reale
+assign ddr.acquire    = hdr_active ? h_acquire : ms_ddr.acquire;
+assign ddr.addr       = hdr_active ? h_addr    : ms_ddr.addr;
+assign ddr.wdata      = hdr_active ? h_wdata   : ms_ddr.wdata;
+assign ddr.read       = hdr_active ? h_read    : ms_ddr.read;
+assign ddr.write      = hdr_active ? h_write   : ms_ddr.write;
+assign ddr.burstcnt   = hdr_active ? 8'd1      : ms_ddr.burstcnt;
+assign ddr.byteenable = hdr_active ? 8'hFF     : ms_ddr.byteenable;
+assign ms_ddr.rdata       = ddr.rdata;
+assign ms_ddr.busy        = ddr.busy;
+assign ms_ddr.rdata_ready = ddr.rdata_ready;
+
+assign busy = ms_busy | hdr_pend | hdr_active;
 
 memory_stream #(.COUNT(COUNT)) memory_stream (
     .clk(clk),
     .reset(reset),
 
-    .ddr(ddr),
+    .ddr(ms_ddr),
 
     .read_req(ssbus.read),
     .read_data(ssbus.data_out),
@@ -167,15 +261,16 @@ memory_stream #(.COUNT(COUNT)) memory_stream (
     .write_req(ssbus.write),
     .write_data(ssbus.data),
 
-    .start_addr(`SS_DDR_BASE_DEF + (index * 32'h00200000)),
-    .length(32'h00200000),
+    .start_addr(sub_addr),
+    .length(32'h00038000),
     .read_start(read_start),
     .write_start(write_start),
-    .busy(busy),
+    .busy(ms_busy),
 
     .chunk_select(ssbus.select),
     .chunk_address(ssbus.addr),
-    .query_req(ssbus.query)
+    .query_req(ssbus.query),
+    .slot_empty(slot_empty)   // [FIX slot vuoto]
 );
 
 endmodule

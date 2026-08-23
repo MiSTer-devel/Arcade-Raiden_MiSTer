@@ -20,6 +20,9 @@
 // Bitswap16 da MAME bitswap<16>(d, b15..b0): out[15]=d[b15], ..., out[0]=d[b0].
 
 module raiden_decrypt (
+	// raidenb (newer hardware): ROM V30 in chiaro → nessun decrypt.
+	// Pilotato dal board select MRA index=1, latchato PRIMA del download ROM.
+	input  wire        bypass,
 	input  wire [26:0] ioctl_addr_in,
 	input  wire [15:0] ioctl_dout_in,
 	input  wire        ioctl_wr_in,
@@ -83,7 +86,7 @@ module raiden_decrypt (
 	// I range enc_main (0x020000-0x05FFFF) e enc_sub (0x060000-0x09FFFF) sono
 	// applicati on-the-fly via XOR + bitswap MAME init_decryption() (raiden.cpp:1187).
 	// Verificato byte-by-byte vs raiden_dec.zip (ROM gia' decifrate offline).
-	wire is_rom_dl = ioctl_download_in & (ioctl_index_in == 16'd0);
+	wire is_rom_dl = ioctl_download_in & (ioctl_index_in == 16'd0) & ~bypass;
 
 	assign ioctl_dout_out = is_rom_dl ? (enc_main ? dec_main :
 	                                     enc_sub  ? dec_sub  :

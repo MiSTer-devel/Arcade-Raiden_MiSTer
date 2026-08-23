@@ -17,6 +17,7 @@
     along with Raiden_MiSTer.  If not, see <http://www.gnu.org/licenses/>.
 
     Author: Umberto Parisi (rmonic79)
+    Version: 1.0
     Date: 2026
 
 */
@@ -32,7 +33,11 @@
 // Tag:   byte_addr[23:11] (word addr [23:10])
 
 module rom_cache #(
-	parameter CACHE_BITS = 9  // 2^9 = 512 entries
+	parameter CACHE_BITS = 9, // 2^9 = 512 entries
+	// FAST_HIT=1: in hit, cpu_ready/cpu_data escono COMBINATORI nel ciclo S_CHECK
+	// (1 clk prima). Default 0 = bit-identico a prima (usato dal main). Il sub lo
+	// abilita per il boost: hit 6 → 4-5 clk di stall (misurato al banco).
+	parameter FAST_HIT = 0
 )
 (
 	input  wire        clk,
@@ -41,8 +46,8 @@ module rom_cache #(
 	// CPU side (from maincpu_map)
 	input  wire [23:0] cpu_addr,     // byte address
 	input  wire        cpu_req,      // rising edge = new request
-	output reg  [15:0] cpu_data,
-	output reg         cpu_ready,    // pulse when data valid
+	output wire [15:0] cpu_data,
+	output wire        cpu_ready,    // pulse when data valid
 
 	// SDRAM side (to sdram_bridge)
 	output reg  [23:0] sdram_addr,
@@ -54,10 +59,10 @@ module rom_cache #(
 localparam ENTRIES = 1 << CACHE_BITS;
 localparam TAG_BITS = 23 - CACHE_BITS;  // word addr is [23:1], index is [CACHE_BITS:1]
 
-// Cache storage
-(* ramstyle = "M10K,no_rw_check" *) reg [15:0]          cache_data [0:ENTRIES-1];
-(* ramstyle = "M10K,no_rw_check" *) reg [TAG_BITS-1:0]  cache_tag  [0:ENTRIES-1];
-reg [ENTRIES-1:0] cache_valid;
+// Cache storage. Valid dentro la M10K del tag ({valid,tag}): con 8K entry un
+// vettore FF sarebbe 8192 registri. Invalidazione = sweep in M10K al reset.
+(* ramstyle = "M10K,no_rw_check" *) reg [15:0]        cache_data [0:ENTRIES-1];
+(* ramstyle = "M10K,no_rw_check" *) reg [TAG_BITS:0]  cache_tag  [0:ENTRIES-1];
 
 // Address decomposition (word address)
 wire [22:0]          word_addr = cpu_addr[23:1];
@@ -70,21 +75,27 @@ reg [TAG_BITS-1:0] rd_tag;
 reg                rd_valid;
 
 always @(posedge clk) begin
-	rd_data  <= cache_data[idx];
-	rd_tag   <= cache_tag[idx];
-	rd_valid <= cache_valid[idx];
+	rd_data              <= cache_data[idx];
+	{rd_valid, rd_tag}   <= cache_tag[idx];
 end
 
 // FSM
-localparam S_IDLE    = 2'd0;
-localparam S_CHECK   = 2'd1;
-localparam S_MISS    = 2'd2;
-localparam S_FILL    = 2'd3;
+localparam S_INIT    = 3'd4;   // sweep invalidazione post-reset
+localparam S_IDLE    = 3'd0;
+localparam S_CHECK   = 3'd1;
+localparam S_MISS    = 3'd2;
+localparam S_FILL    = 3'd3;
 
-reg  [1:0]  state;
+reg  [2:0]  state;
+reg [CACHE_BITS-1:0] init_cnt;
 reg         req_prev;
 reg [22:0]  pending_word_addr;
 reg [TAG_BITS-1:0] pending_tag;
+reg                cpu_ready_r;
+reg         [15:0] cpu_data_r;
+wire               hit_now = (state == S_CHECK) && rd_valid && (rd_tag == pending_tag);
+assign cpu_ready = cpu_ready_r | (FAST_HIT ? hit_now : 1'b0);
+assign cpu_data  = (FAST_HIT && hit_now) ? rd_data : cpu_data_r;
 reg [CACHE_BITS-1:0] pending_idx;
 
 // Level-triggered: ogni volta che siamo in IDLE e cpu_req=1 parte un nuovo lookup.
@@ -92,18 +103,25 @@ reg [CACHE_BITS-1:0] pending_idx;
 // L'indirizzo viene latchato all'inizio del lookup; cpu_ready resta alto 1 ciclo
 // alla fine (per non far ripartire il fetch finché V30 non aggiorna l'addr).
 always @(posedge clk) begin
-	cpu_ready  <= 1'b0;
+	cpu_ready_r <= 1'b0;
 	sdram_req  <= 1'b0;
 
 	if (reset) begin
-		state             <= S_IDLE;
+		state             <= S_INIT;
 		req_prev          <= 0;
-		cache_valid       <= {ENTRIES{1'b0}};
+		init_cnt          <= 0;
 		pending_word_addr <= 23'h7FFFFF;   // valore impossibile come "last served"
 	end else begin
 		req_prev <= cpu_req;
 
 		case (state)
+			S_INIT: begin
+				// sweep: invalida tutte le entry (valid=0 nel tag M10K)
+				cache_tag[init_cnt] <= {(TAG_BITS+1){1'b0}};
+				init_cnt <= init_cnt + 1'b1;
+				if (init_cnt == {CACHE_BITS{1'b1}}) state <= S_IDLE;
+			end
+
 			S_IDLE: begin
 				// Start new lookup whenever cpu_req is high AND the address
 				// is different from the last one served (avoid re-serving in loop).
@@ -118,9 +136,9 @@ always @(posedge clk) begin
 			S_CHECK: begin
 				// Cache read results available (1 cycle BRAM latency)
 				if (rd_valid && rd_tag == pending_tag) begin
-					// HIT — return cached data immediately
-					cpu_data  <= rd_data;
-					cpu_ready <= 1'b1;
+					// HIT — return cached data immediately (FAST_HIT: gia' uscito combinatorio)
+					cpu_data_r <= rd_data;
+					if (!FAST_HIT) cpu_ready_r <= 1'b1;
 					state     <= S_IDLE;
 				end else begin
 					// MISS — fetch from SDRAM
@@ -135,10 +153,9 @@ always @(posedge clk) begin
 				if (sdram_ready) begin
 					// Fill cache and return data
 					cache_data[pending_idx]  <= sdram_data;
-					cache_tag[pending_idx]   <= pending_tag;
-					cache_valid[pending_idx] <= 1'b1;
-					cpu_data  <= sdram_data;
-					cpu_ready <= 1'b1;
+					cache_tag[pending_idx]   <= {1'b1, pending_tag};
+					cpu_data_r <= sdram_data;
+					cpu_ready_r <= 1'b1;
 					state     <= S_IDLE;
 				end
 			end

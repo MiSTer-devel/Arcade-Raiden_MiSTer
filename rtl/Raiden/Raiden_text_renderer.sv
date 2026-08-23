@@ -56,6 +56,10 @@ module Raiden_text_renderer (
 	input  wire        reset,
 	input  wire        ce_pix,
 
+	// raidenb (newer hardware): text tilemap TILEMAP_SCAN_COLS (raiden.cpp:463-471)
+	// → vram_addr = col*32+row invece di row*32+col. 0 = set classici (SCAN_ROWS).
+	input  wire        scan_cols,
+
 	// Text decoder mode esteso (7 bit):
 	//   bit 0: BS  byte swap (crom_lo ↔ crom_hi)
 	//   bit 1: SI  sub direction (3-sub vs sub)
@@ -155,7 +159,9 @@ module Raiden_text_renderer (
 	wire  [2:0] col_s0    = eff_x_s[2:0];
 
 	always @(posedge clk) begin
-		if (ce_pix) vram_addr <= {1'b0, tile_y_s0, tile_x_s0};   // 11-bit, SCAN_ROWS: row*32+col
+		// SCAN_ROWS: row*32+col (set classici) / SCAN_COLS: col*32+row (raidenb)
+		if (ce_pix) vram_addr <= scan_cols ? {1'b0, tile_x_s0, tile_y_s0}
+		                                   : {1'b0, tile_y_s0, tile_x_s0};
 	end
 
 	// --- Stage 1: vram_data, decode tile + color ---

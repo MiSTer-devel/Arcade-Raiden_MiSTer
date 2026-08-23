@@ -4,7 +4,7 @@
 /*  This file is part of Raiden_MiSTer.
     GPL-3.
     Original author: Martin Donlon (wickerwaka) — Arcade-TaitoF2 savestate system.
-    Modified/adapted for BoogieWings by: Umberto Parisi (rmonc79)
+    Modified/adapted for Raiden by: Umberto Parisi (rmonic79)
 */
 
 //============================================================================
@@ -27,7 +27,7 @@ module savestate_ui #(parameter INFO_TIMEOUT_BITS)
     input            joyStart,
     input            joyRewind,
     input            rewindEnable,
-    input      [1:0] status_slot,
+    input      [4:0] status_slot,   // 32 slot
     input            autoincslot,
     input      [1:0] OSD_saveload,
     output reg       ss_save,
@@ -35,10 +35,10 @@ module savestate_ui #(parameter INFO_TIMEOUT_BITS)
     output reg       ss_info_req,
     output reg [7:0] ss_info,
     output reg       statusUpdate,
-    output     [1:0] selected_slot
+    output     [4:0] selected_slot  // 32 slot: [4:3]=regione, [2:0]=sotto-slot
 );
 
-reg [1:0] ss_base = 0;
+reg [4:0] ss_base = 0;
 
 reg lastRight  = 1'b0;
 reg lastLeft   = 1'b0;
@@ -102,7 +102,7 @@ always @(posedge clk) begin
                 InfoWaitcnt <= 25'b0;
             end
             // switch slot
-            if (joyRight & ~lastRight & ss_base < 3) begin
+            if (joyRight & ~lastRight & ss_base < 5'd31) begin
                 ss_base      <= ss_base + 1'd1;
                 statusUpdate <= 1'b1;
                 slotswitched <= 1'b1;

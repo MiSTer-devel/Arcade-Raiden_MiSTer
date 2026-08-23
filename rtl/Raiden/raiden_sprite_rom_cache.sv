@@ -25,35 +25,35 @@ module raiden_sprite_rom_cache #(
 	// Renderer interface (rising-edge protocol)
 	input  wire [23:0] req_addr,
 	input  wire        req_pulse,
-	output reg  [31:0] resp_data,
+	output reg  [63:0] resp_data,
 	output reg         resp_valid,
 
 	// DDR3 read port (toggle protocol, 32-bit data)
 	output reg  [27:0] ddr_addr,
 	output reg         ddr_req,
-	input  wire [31:0] ddr_data,
+	input  wire [63:0] ddr_data,
 	input  wire        ddr_ack
 );
 
 // =====================================================================
 // 2-way set associative cache
 // =====================================================================
-(* ramstyle = "M10K" *) reg [31:0] cache_data_w0 [0:1023];
-(* ramstyle = "M10K" *) reg [31:0] cache_data_w1 [0:1023];
+(* ramstyle = "M10K" *) reg [63:0] cache_data_w0 [0:1023];   // entry = riga di tile 64 bit
+(* ramstyle = "M10K" *) reg [63:0] cache_data_w1 [0:1023];
 (* ramstyle = "M10K" *) reg [10:0] cache_tag_w0  [0:1023];   // [10]=valid, [9:0]=tag
 (* ramstyle = "M10K" *) reg [10:0] cache_tag_w1  [0:1023];
 // LRU 1-bit per set: 0=way0 LRU, 1=way1 LRU.
 reg lru [0:1023];
 
-wire [9:0]  req_idx    = req_addr[11:2];
-wire [9:0]  req_tag_in = req_addr[21:12];
+wire [9:0]  req_idx    = req_addr[12:3];
+wire [9:0]  req_tag_in = req_addr[22:13];
 
 // Clear post-reset: 1024 cicli azzerano tag (valid=0) per entrambe le way
 reg [9:0]  clr_cnt;
 reg        cache_ready;
 
 // BRAM lookup registered (1 ck latency)
-reg [31:0] cache_data_q_w0, cache_data_q_w1;
+reg [63:0] cache_data_q_w0, cache_data_q_w1;
 reg [10:0] cache_tag_q_w0,  cache_tag_q_w1;
 reg [9:0]  req_tag_q;
 reg [9:0]  req_idx_q;
@@ -87,7 +87,7 @@ reg [23:0] pending_addr;
 reg        cache_we_w0, cache_we_w1;
 reg [9:0]  cache_we_idx;
 reg [10:0] cache_we_tag;
-reg [31:0] cache_we_data;
+reg [63:0] cache_we_data;
 reg        lru_we;
 reg        lru_we_val;
 
@@ -113,13 +113,13 @@ always @(posedge clk) begin
 		ddr_req       <= 1'b0;
 		ddr_addr      <= 28'd0;
 		resp_valid    <= 1'b0;
-		resp_data     <= 32'd0;
+		resp_data     <= 64'd0;
 		pending_addr  <= 24'd0;
 		cache_we_w0   <= 1'b0;
 		cache_we_w1   <= 1'b0;
 		cache_we_idx  <= 10'd0;
 		cache_we_tag  <= 11'd0;
-		cache_we_data <= 32'd0;
+		cache_we_data <= 64'd0;
 		lru_we        <= 1'b0;
 		lru_we_val    <= 1'b0;
 	end else begin
@@ -134,7 +134,7 @@ always @(posedge clk) begin
 				cache_we_w1  <= 1'b1;
 				cache_we_idx <= clr_cnt;
 				cache_we_tag <= 11'd0;     // valid=0
-				cache_we_data<= 32'd0;
+				cache_we_data<= 64'd0;
 				if (clr_cnt == 10'd1023) begin
 					cache_ready <= 1'b1;
 					state       <= ST_IDLE;
@@ -160,7 +160,7 @@ always @(posedge clk) begin
 					state        <= ST_IDLE;
 				end else begin
 					// Lancia DDR3 fetch (offset DDR base + pending_addr 24-bit)
-					ddr_addr <= DDR_BASE_ADDR + {4'd0, pending_addr};
+					ddr_addr <= DDR_BASE_ADDR + {4'd0, pending_addr[23:3], 3'b000};
 					ddr_req  <= ~ddr_req;
 					state    <= ST_WAIT_RAM;
 				end
@@ -170,8 +170,8 @@ always @(posedge clk) begin
 				if (ddr_req == ddr_ack) begin
 					resp_data    <= ddr_data;
 					resp_valid   <= 1'b1;
-					cache_we_idx <= pending_addr[11:2];
-					cache_we_tag <= {1'b1, pending_addr[21:12]};
+					cache_we_idx <= pending_addr[12:3];
+					cache_we_tag <= {1'b1, pending_addr[22:13]};
 					cache_we_data<= ddr_data;
 					if (lru_q) cache_we_w1 <= 1'b1;
 					else       cache_we_w0 <= 1'b1;

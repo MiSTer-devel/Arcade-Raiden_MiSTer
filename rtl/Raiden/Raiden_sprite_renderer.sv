@@ -69,7 +69,7 @@ module Raiden_sprite_renderer (
 	// SDRAM tile fetch via arbiter (client r3, kind=3, no cache)
 	output reg         rom_req,
 	output reg  [23:0] rom_addr,
-	input  wire [31:0] rom_data,
+	input  wire [63:0] rom_data,   // riga di tile intera (64 bit): meta' sx in [31:0], dx in [63:32]
 	input  wire        rom_valid,
 
 	// Output pixel (combinatoriale: ultimo pixel a destra mostrato senza latency)
@@ -82,8 +82,8 @@ module Raiden_sprite_renderer (
 	// Layout 10-bit: [9:6]=color (4-bit MAME Raiden), [5:4]=pri_code, [3:0]=pen
 	// Valid pixel = pen != 0xF (15 = trasparente in MAME)
 	localparam [9:0] LB_EMPTY = 10'h00F;     // color=0, pri=0, pen=15 (trasparente)
-	(* ramstyle = "M10K,no_rw_check" *) reg [9:0] linebuf0 [0:319];
-	(* ramstyle = "M10K,no_rw_check" *) reg [9:0] linebuf1 [0:319];
+	(* ramstyle = "M10K,no_rw_check" *) reg [9:0] linebuf0 [0:511];
+	(* ramstyle = "M10K,no_rw_check" *) reg [9:0] linebuf1 [0:511];
 	reg        active_buf;
 
 	// ─── Sprite scan FSM ─────────────────────────────────────────────────────
@@ -162,7 +162,7 @@ module Raiden_sprite_renderer (
 
 	// Iteratore tile_x
 	reg  [3:0] tile_x_pf;
-	reg [31:0] pf_rom_data;
+	reg [63:0] pf_rom_data;   // 64 bit: entrambe le meta' della riga
 	reg  [3:0] decode_step;
 	wire  [3:0] eff_tile_x = sp_flipx ? (sp_w - 4'd1 - tile_x_pf) : tile_x_pf;
 
@@ -271,11 +271,10 @@ module Raiden_sprite_renderer (
 				end
 
 				SC_ROM_REQ: begin
-					// Sprite tile addr in SDRAM region (byte_offset relativo):
-					// tile_code * 128 (32 word) + (pf_side ? 64 byte : 0) + eff_row * 4
+					// Layout riordinato: riga di tile a tile*128 + eff_row*8 (64 bit =
+					// entrambe le meta'). Una sola richiesta per riga (pf_side==0).
 					rom_addr <= ({4'd0, cur_tile, 7'd0})        // tile*128
-					           + (pf_side ? 24'd64 : 24'd0)     // metà dx tile
-					           + ({18'd0, eff_row, 2'd0});       // row*4
+					           + ({17'd0, eff_row, 3'd0});       // row*8
 					rom_req  <= 1'b1;
 					sc_state <= SC_ROM_W;
 				end
@@ -291,7 +290,7 @@ module Raiden_sprite_renderer (
 
 				SC_DECODE: begin
 					begin : sp_decode_blk
-						reg [31:0] pf_data_eff;
+						reg [31:0] half32, pf_data_eff;
 						reg [7:0] byte_a, byte_b;
 						reg [1:0] sub;
 						reg [2:0] bit_lo, bit_hi;
@@ -306,10 +305,12 @@ module Raiden_sprite_renderer (
 						//   bit 3: pf_rom_data byte-reverse (= rotazione 32-bit)
 						//   bit 4: nibble-swap dentro ogni byte (HI↔LO 4-bit)
 
+						// meta' corrente della riga (pf_side 0=sx bit31:0, 1=dx bit63:32)
+						half32 = pf_side ? pf_rom_data[63:32] : pf_rom_data[31:0];
 						// bit 3: byte-reverse 32-bit
 						pf_data_eff = decode_mode[3] ?
-						              {pf_rom_data[7:0], pf_rom_data[15:8], pf_rom_data[23:16], pf_rom_data[31:24]} :
-						              pf_rom_data;
+						              {half32[7:0], half32[15:8], half32[23:16], half32[31:24]} :
+						              half32;
 
 						// bit 4: nibble-swap per byte (per ognuno dei 4 byte, swap nibble HI ↔ LO)
 						if (decode_mode[4]) begin
@@ -368,9 +369,10 @@ module Raiden_sprite_renderer (
 
 				SC_NEXT_TX: begin
 					if (pf_side == 1'b0) begin
-						// Appena finito metà sx → fai metà dx dello stesso tile
-						pf_side  <= 1'b1;
-						sc_state <= SC_ROM_REQ;
+						// meta' dx GIA' nel dato a 64 bit → decodifica diretta, niente fetch
+						pf_side     <= 1'b1;
+						decode_step <= 4'd0;
+						sc_state    <= SC_DECODE;
 					end else begin
 						// Finito anche metà dx → passa al prossimo tile_x o entry
 						pf_side <= 1'b0;
@@ -415,9 +417,17 @@ module Raiden_sprite_renderer (
 		end
 	end
 
-	// ─── Read side combinatoriale ────────────────────────────────────────────
+	// ─── Read side (registrata M10K + lookahead 1 = latenza netta 0) ─────────
+	// Legge hpos+1: dato registrato per hpos pronto al display. Bordo pixel-0 primato
+	// dai 48 cicli hblank; active_buf stabile nel visibile. Behavior-preserving.
 	// Layout linebuf: [9:6]=color (4-bit), [5:4]=pri, [3:0]=pen
-	wire  [9:0] read_data = active_buf ? linebuf1[hpos[8:0]] : linebuf0[hpos[8:0]];
+	wire [8:0] rd_addr = hpos[8:0] + 9'd1;
+	reg [9:0] lb0_q, lb1_q;
+	always @(posedge clk) if (ce_pix) begin
+		lb0_q <= linebuf0[rd_addr];
+		lb1_q <= linebuf1[rd_addr];
+	end
+	wire  [9:0] read_data = active_buf ? lb1_q : lb0_q;
 	wire  [3:0] read_pen   = read_data[3:0];
 	wire  [1:0] read_pri   = read_data[5:4];
 	wire  [3:0] read_color = read_data[9:6];
@@ -427,5 +437,29 @@ module Raiden_sprite_renderer (
 	assign opaque    = pixel_active;
 	assign pen_index = pixel_active ? (11'h200 + {3'd0, read_color, read_pen}) : 11'd0;
 	assign pri_code  = pixel_active ? read_pri : 2'd0;
+
+`ifdef V30_SIM_PROBES
+// Probe taglio sprite: righe in cui lo scan NON completa la lista entry
+// prima del new_line (= sprite successivi non disegnati su quella riga).
+integer spr_cut_n = 0;
+always @(posedge clk) begin
+	if (new_line && sc_state != SC_DONE && sc_state != SC_IDLE && spr_cut_n < 60) begin
+		spr_cut_n <= spr_cut_n + 1;
+		$display("[sprcut] vpos=%0d scan INCOMPLETO: state=%0d entry=%0d", vpos, sc_state, entry_idx);
+	end
+end
+
+// Probe PRIORITA': dump entry attive su UNA riga scelta (vpos==dbg_row), con
+// pri grezza da w2. Distingue "pri=0 dal gioco" da "pri corrotta dal buffer".
+integer spr_dump_n = 0;
+reg [8:0] dbg_row = 9'd120;
+always @(posedge clk) begin
+	if (sc_state == SC_CHECK && vpos == dbg_row && sp_enable && spr_dump_n < 40) begin
+		spr_dump_n <= spr_dump_n + 1;
+		$display("[sprpri] e%0d pri=%0d y=%0d x=%0d code=%0h col=%0d w0=%04h w2=%04h",
+		         entry_idx, sp_w2[15:14], sp_w0[7:0], sp_w2[8:0], sp_w1[11:0], sp_w0[11:8], sp_w0, sp_w2);
+	end
+end
+`endif
 
 endmodule

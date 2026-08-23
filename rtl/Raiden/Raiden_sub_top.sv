@@ -79,9 +79,38 @@ always @(posedge clk) begin
 		vblank_d <= vblank_in;
 		if (vblank_in && !vblank_d)        irq_pending <= 1'b1;
 		if (cpu_irq_active && irq_pending) irq_pending <= 1'b0;
+		// RESTAURO SAVESTATE: irq_pending NON fa parte dello stato salvato, quindi
+		// dopo un caricamento conterrebbe cio' che stava succedendo nella partita
+		// IN CORSO, non nello stato ripristinato: la CPU appena restaurata poteva
+		// prendere un interrupt in piu' che lo stato salvato non prevedeva (nella
+		// sub la routine di interrupt serve gli sprite, e un passaggio di troppo
+		// lascia oggetti fuori giro). Qui si riparte deterministici da "nessun
+		// interrupt sospeso": al massimo se ne perde uno e il VBlank successivo lo
+		// rialza un frame dopo. NB: vblank_d NON viene toccato di proposito —
+		// azzerarlo con vblank_in alto creerebbe un fronte falso al ciclo dopo.
+		// Fuori dalla finestra di reload il comportamento e' identico a prima.
+		if (ss_cpu_reload)                 irq_pending <= 1'b0;
 	end
 end
 assign dbg_irq_pending = irq_pending;
+
+// irq_pending gira a clk LIBERO e il suo cono arriva ai registri di SEGMENTO
+// della richiesta nel BIU (r_rq_seg), cioe' dentro il calcolo dell'indirizzo
+// fisico del ciclo di bus. MISURATO 2026-08-17 sulla build 15:05, con la
+// coperta `irq_pending -> *v30_core:u_core*` rimossa dall'SDC:
+//     -3.385 ns   irq_pending -> v30u_biu:u_biu|r_rq_seg[1][0]
+// cioe' il percorso chiede 15.885 ns e a clock libero ne ha 12.5. La coperta
+// dichiarava 2 periodi dove ce n'e' 1: STA verde e SILICIO CHE SBAGLIA -- la
+// stessa forma del bug punteggio storico (multicycle 9 falso, -11.03/-11.85)
+// e di CE_HALF a +1 clk (-11.316, vedi cpu_v30_bridge). L'INT arriva a vblank,
+// quando il gioco disegna l'HUD: se il fronte cade mentre il BIU forma il
+// segmento, il ciclo va all'indirizzo sbagliato -> tile nella cella accanto.
+// Registrandolo su ce il lancio e' ce-paced: il percorso diventa CE->CE e ha
+// 62.5 ns (CE_GAP_MIN=5) contro i 15.885 richiesti. INT e' un livello che resta
+// alto fino all'acknowledge, quindi un ce di ritardo non cambia la semantica.
+reg irq_pending_ce;
+always @(posedge clk) if (ce) irq_pending_ce <= irq_pending;
+
 
 // ─── Address translator ─────────────────────────────────────────────────
 wire        ls245_en;
@@ -110,21 +139,18 @@ raiden_addr_sub u_addr (
 reg sub_rq_active;
 reg sub_rd_lat;
 reg [15:0] sub_ram_rom_data;
-reg sub_rom_addr_lo;
 reg [23:0] sub_rom_addr_lat;
 always @(posedge clk) begin
 	if (reset) begin
 		sub_rq_active    <= 1'b0;
 		sub_rd_lat       <= 1'b0;
 		sub_ram_rom_data <= 16'd0;
-		sub_rom_addr_lo  <= 1'b0;
 		sub_rom_addr_lat <= 24'd0;
 	end else begin
 		sub_rd_lat <= cpu_rd;
 		if (!sub_rq_active) begin
 			if (ls245_en && cpu_rd && !sub_rd_lat) begin
 				sub_rq_active    <= 1'b1;
-				sub_rom_addr_lo  <= cpu_addr[0];
 				sub_rom_addr_lat <= sdr_addr;
 			end
 		end else if (sub_rom_ready) begin
@@ -133,18 +159,42 @@ always @(posedge clk) begin
 		end
 	end
 end
-assign sub_rom_addr = sub_rom_addr_lat;
-assign sub_rom_req  = sub_rq_active;
+// BOOST sub (2026-08-21): la richiesta alla cache parte nello STESSO ciclo di
+// ls245_en (prima partiva 1 clk dopo, dal registro sub_rq_active): con la cache
+// FAST_HIT la latenza di hit scende da 6 a 4 clk di stall. Il settle da 2 clk
+// dopo il ready resta INTATTO (cura del punteggio sporco ba9cf5e / boot nero).
+wire sub_rom_early = ls245_en & cpu_rd & ~sub_rd_lat & ~sub_rq_active;
+assign sub_rom_addr = sub_rq_active ? sub_rom_addr_lat : sdr_addr;
+assign sub_rom_req  = sub_rq_active | sub_rom_early;
+
+
+// LAG DI ASSESTAMENTO DOPO IL FETCH (root-cause storico ba9cf5e, adattato).
+// sub_ram_rom_data si aggiorna al clock in cui arriva sub_rom_ready; rdata_q in
+// v30_bus lo campiona UN clock dopo. Se il CE riparte subito, il BIU consuma
+// la parola PRECEDENTE: e' l'immediato letto storto che disallinea indice/NUL
+// in itoa (0xfe55) -> il NUL non termina la stringa -> strcpy 0xf150 sfora di
+// 2 celle con residuo stantio -> punteggio con 2 celle sporche, RAM corretta.
+// Il bridge aveva un lag conservativo di 2 clk per questo motivo; il passaggio
+// al CE-stall l'ha perso. Qui lo ripristino: lo stallo resta alto 2 clk dopo
+// il ready, cioe' finche' rdata_q non presenta il dato nuovo.
+reg [1:0] rom_settle;
+always @(posedge clk) begin
+	if (reset)                            rom_settle <= 2'd0;
+	else if (sub_rq_active && sub_rom_ready)   rom_settle <= 2'd2;
+	else if (rom_settle != 2'd0)          rom_settle <= rom_settle - 2'd1;
+end
+wire sub_stall_eff = sub_rq_active | (rom_settle != 2'd0);
 
 // ─── CE generator pattern M72 ───────────────────────────────────────────
 wire ce, ce_4x;
-raiden_ce_gen u_ce (
+raiden_ce_gen #(.PHASE_INIT(4'd4)) u_ce (   // sfasato di 4 clk vs Main: mai richieste SDRAM simultanee
 	.clk           (clk),
 	.reset         (reset),
 	.pause         (pause),
 	.clk_sel       (clk_sel),
 	.ls245_en      (ls245_en),
-	.mem_rq_active (sub_rq_active),
+	.rd_lat        (sub_rd_lat),
+	.mem_rq_active (sub_stall_eff),
 	.ce            (ce),
 	.ce_4x         (ce_4x)
 );
@@ -155,13 +205,14 @@ cpu_v30_bridge #(.SS_IDX(SS_IDX_CPU)) u_cpu (
 	.ce            (ce),
 	.ce_4x         (ce_4x),
 	.reset         (reset),
+	.rom_wait      (sub_rq_active),
 	.bus_addr      (cpu_addr),
 	.bus_read      (cpu_rd),
 	.bus_write     (cpu_wr),
 	.bus_be        (cpu_be),
 	.bus_dout      (cpu_dout),
 	.bus_din       (cpu_din),
-	.irq_req       (irq_pending),
+	.irq_req       (irq_pending_ce),
 	.irq_vector    (10'h0C8),
 	.cpu_idle      (cpu_idle),
 	.cpu_halt      (),
@@ -180,9 +231,9 @@ initial begin
 end
 
 wire [11:0] ram_word_addr = cpu_addr[12:1];
-wire ram_wr_lo = cpu_wr && cpu_be[0] && !cpu_be[1] && !cpu_addr[0];
-wire ram_wr_hi = cpu_wr && cpu_be[0] && !cpu_be[1] &&  cpu_addr[0];
-wire ram_wr_w  = cpu_wr && cpu_be[0] &&  cpu_be[1];
+// M72-native byte lanes: cpu_be[0]=lane bassa, cpu_be[1]=lane alta; cpu_dout già allineato.
+wire cpu_we_lo = cpu_wr && cpu_be[0];
+wire cpu_we_hi = cpu_wr && cpu_be[1];
 
 // Savestate su porta B dedicata (dual-port M10K): la porta A CPU resta
 // IDENTICA all'originale → zero disturbo al path vivo (non tocca il fit).
@@ -200,12 +251,8 @@ reg [15:0] ram_rdata;
 // Porta A — CPU sub (live, invariata)
 always @(posedge clk) begin
 	if (ram_memrq) begin
-		if (ram_wr_lo) ram_lo[ram_word_addr] <= cpu_dout[7:0];
-		if (ram_wr_hi) ram_hi[ram_word_addr] <= cpu_dout[7:0];
-		if (ram_wr_w) begin
-			ram_lo[ram_word_addr] <= cpu_dout[7:0];
-			ram_hi[ram_word_addr] <= cpu_dout[15:8];
-		end
+		if (cpu_we_lo) ram_lo[ram_word_addr] <= cpu_dout[7:0];
+		if (cpu_we_hi) ram_hi[ram_word_addr] <= cpu_dout[15:8];
 	end
 	ram_rdata <= {ram_hi[ram_word_addr], ram_lo[ram_word_addr]};
 end
@@ -262,42 +309,28 @@ raiden_video_subbus #(
 // ─── Shared RAM bridge (Sub side) ──────────────────────────────────────
 assign sub_shared_addr  = cpu_addr[11:1];
 assign sub_shared_cs    = shared_memrq;
-assign sub_shared_we    = (shared_memrq && cpu_wr) ?
-                          ((cpu_be[1] && cpu_be[0]) ? 2'b11 :
-                           (cpu_be[0] && !cpu_addr[0]) ? 2'b01 :
-                           (cpu_be[0] &&  cpu_addr[0]) ? 2'b10 : 2'b00) : 2'b00;
-assign sub_shared_wdata = (cpu_be[0] && !cpu_be[1] && cpu_addr[0]) ?
-                          {cpu_dout[7:0], cpu_dout[7:0]} : cpu_dout;
+assign sub_shared_we    = (shared_memrq && cpu_wr) ? {cpu_be[1], cpu_be[0]} : 2'b00;
+assign sub_shared_wdata = cpu_dout;
 
 // ─── DOUT_VALID mux for cpu_din ────────────────────────────────────────
 reg ram_rd_lat, shared_rd_lat;
-reg cpu_addr_lo_lat;
 
 always @(posedge clk) begin
 	if (reset) begin
 		ram_rd_lat      <= 1'b0;
 		shared_rd_lat   <= 1'b0;
-		cpu_addr_lo_lat <= 1'b0;
 	end else begin
 		ram_rd_lat      <= cpu_rd & ram_memrq;
 		shared_rd_lat   <= cpu_rd & shared_memrq;
-		cpu_addr_lo_lat <= cpu_addr[0];
 	end
 end
 
-function [15:0] byte_align;
-	input [15:0] data;
-	input        addr_lo;
-	begin
-		byte_align = addr_lo ? {data[7:0], data[15:8]} : data;
-	end
-endfunction
-
+// Core M72 lane-aware: word naturale, il core seleziona il byte (niente byte_align).
 always @(*) begin
-	if      (vbus_DOUT_VALID) cpu_din = vbus_DOUT;            // BG/FG/Palette già aligned
-	else if (ram_rd_lat)      cpu_din = byte_align(ram_rdata,         cpu_addr_lo_lat);
-	else if (shared_rd_lat)   cpu_din = byte_align(sub_shared_rdata,  cpu_addr_lo_lat);
-	else                       cpu_din = byte_align(sub_ram_rom_data, sub_rom_addr_lo);    // fallback ROM (SDRAM)
+	if      (vbus_DOUT_VALID) cpu_din = vbus_DOUT;
+	else if (ram_rd_lat)      cpu_din = ram_rdata;
+	else if (shared_rd_lat)   cpu_din = sub_shared_rdata;
+	else                       cpu_din = sub_ram_rom_data;    // fallback ROM (SDRAM)
 end
 
 // ─── Debug taps (palette_overlay e simili) — tied-off ─────────────────
@@ -306,5 +339,40 @@ assign dbg_cpu_dout      = cpu_dout;
 assign dbg_cpu_be        = cpu_be;
 assign dbg_cpu_wr        = cpu_wr;
 assign dbg_palette_memrq = palette_memrq;
+
+`ifdef V30_SIM_PROBES
+// ── TEMPO DI SERVIZIO DEL SUB (quanto il MAIN lo aspetta) ────────────────
+// Il main manda un comando in shared RAM (sub 0x4000 = main 0x8000), poi
+// SPIN-ASPETTA a FB2B7 che il sub scriva [0x4000]=0 (FCD80 "ho finito").
+// Misuro per ogni comando: clk fra la PRIMA lettura del sub di [0x4000]
+// che trova != 0 (FCCE2 esce dal suo spin) e la scrittura [0x4000]=0.
+// Se questo tempo cresce con la scena e si avvicina/supera il frame
+// (1.346.560 clk), il main e' fermo ad aspettare = RALLENTAMENTO.
+integer sv_t0 = -1, sv_n = 0, sv_max = 0, sv_sum = 0, sv_clk = 0;
+reg     sv_busy = 0;
+always @(posedge clk) begin
+    sv_clk <= sv_clk + 1;
+    // lettura sub di [4000] con dato != 0: il sub ha preso il comando
+    if (shared_memrq && cpu_rd && cpu_addr[11:1] == 11'd0 && !sv_busy &&
+        u_cpu.u_core.t_state == 3'd3 && u_cpu.u_core.lat_type == 3'b101 &&
+        sub_shared_rdata != 16'd0) begin
+        sv_busy <= 1'b1; sv_t0 <= sv_clk;
+    end
+    // scrittura sub di [4000]=0: finito
+    if (shared_memrq && cpu_wr && cpu_addr[11:1] == 11'd0 && sv_busy &&
+        cpu_dout == 16'd0) begin
+        sv_busy <= 1'b0; sv_n <= sv_n + 1;
+        sv_sum <= sv_sum + (sv_clk - sv_t0);
+        if (sv_clk - sv_t0 > sv_max) sv_max <= sv_clk - sv_t0;
+        if (sv_clk - sv_t0 > 32'd400000)
+            $display("[subsvc] comando servito in %0d clk = %0d%% frame", sv_clk - sv_t0, ((sv_clk - sv_t0)*100)/1346560);
+    end
+    if (sv_clk % 1346560 == 0 && sv_clk != 0) begin
+        $display("[subsvc] frame: comandi=%0d  medio=%0d clk  max=%0d clk (%0d%% frame)",
+                 sv_n, (sv_n != 0) ? sv_sum / sv_n : 0, sv_max, (sv_max*100)/1346560);
+        sv_n <= 0; sv_sum <= 0; sv_max <= 0;
+    end
+end
+`endif
 
 endmodule
