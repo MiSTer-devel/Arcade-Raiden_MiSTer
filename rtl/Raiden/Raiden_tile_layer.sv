@@ -49,6 +49,11 @@ module Raiden_tile_layer #(
 	input  wire        layer_en,
 	input  wire        new_line,
 
+	// Flip DIP: mirrora la riga-contenuto del prefetch (vedi target_y).
+	// La vpos in ingresso resta REALE (tempo): latch scroll allineato alla
+	// copy spriteram anche in flip.
+	input  wire        flip_screen,
+
 	input  wire [15:0] scroll_x,
 	input  wire [15:0] scroll_y,
 
@@ -78,8 +83,8 @@ module Raiden_tile_layer #(
 	// 12 bit/pixel: {color[3:0], 4'd0, pen[3:0]} → ricostruito al read in pen_index
 	// Bit10 (extra) per "pen=15 transparent" = bit 7 del campo a 12 bit (impostato da decode)
 	// Layout: [11:8]=color, [7]=transp_flag, [6:4]=000, [3:0]=pen
-	(* ramstyle = "M10K,no_rw_check" *) reg [11:0] linebuf0 [0:319];
-	(* ramstyle = "M10K,no_rw_check" *) reg [11:0] linebuf1 [0:319];
+	(* ramstyle = "M10K,no_rw_check" *) reg [11:0] linebuf0 [0:511];
+	(* ramstyle = "M10K,no_rw_check" *) reg [11:0] linebuf1 [0:511];
 	reg        active_buf;
 
 	// Prefetcher state
@@ -147,8 +152,17 @@ module Raiden_tile_layer #(
 		end
 	end
 
-	wire [15:0] target_y = (vpos == V_VISIBLE) ? 16'd0
-	                                           : ({7'd0, vpos} + 16'd1);
+	// FLIP (fix desync sprite/BG in flip, 2026-08-21): il mirror va applicato
+	// SOLO alla riga-contenuto da prefetchare, MAI alla vpos che governa le
+	// condizioni di TEMPO (scroll latch, gated_new_line, riga-0 speciale).
+	// Prima il top passava vpos specchiata (222-vpos): il latch scroll cadeva
+	// ~37 linee dopo la copy spriteram → sfondo con scroll frame N+1 e sprite
+	// frame N = oggetti di terra desincronizzati dal terreno (il bug v111
+	// riappariva in flip). Contenuto identico a prima: 224-(vpos+1) = 223-vpos.
+	wire [15:0] target_y_raw = (vpos == V_VISIBLE) ? 16'd0
+	                                               : ({7'd0, vpos} + 16'd1);
+	// 224-raw = riga-identico al percorso 1.0 (vpos_in=222-v → target=223-v).
+	wire [15:0] target_y = flip_screen ? (16'd224 - target_y_raw) : target_y_raw;
 	wire [15:0] eff_y_pf = target_y + scroll_y_lat + {{6{yoff[9]}}, yoff};
 	wire  [4:0] tile_y_pf = eff_y_pf[8:4];
 	wire  [3:0] row_pf    = eff_y_pf[3:0];
@@ -377,8 +391,17 @@ module Raiden_tile_layer #(
 		end
 	end
 
-	// ─── Read side ─────────────────────────────────────────────────────────
-	wire [11:0] read_data  = active_buf ? linebuf1[hpos[8:0]] : linebuf0[hpos[8:0]];
+	// ─── Read side (registrata M10K + lookahead 1 = latenza netta 0) ────────
+	// Legge hpos+1: il dato registrato per hpos e' pronto al ciclo di display giusto.
+	// Bordo pixel-0 primato dai 48 cicli di hblank (a timing_hpos=47 rd_addr=0 via wrap);
+	// active_buf stabile nel visibile (swap a timing_hpos=0). Behavior-preserving.
+	wire [8:0] rd_addr = hpos[8:0] + 9'd1;
+	reg [11:0] lb0_q, lb1_q;
+	always @(posedge clk) if (ce_pix) begin
+		lb0_q <= linebuf0[rd_addr];
+		lb1_q <= linebuf1[rd_addr];
+	end
+	wire [11:0] read_data  = active_buf ? lb1_q : lb0_q;
 	wire  [3:0] read_color = read_data[11:8];
 	wire        read_transp = read_data[7];
 	wire  [3:0] read_pen   = read_data[3:0];
@@ -387,5 +410,30 @@ module Raiden_tile_layer #(
 	wire pixel_active = de & layer_en & (hpos < 10'd256) & ~read_transp;
 	assign opaque    = pixel_active;
 	assign pen_index = pixel_active ? (COLOR_BASE + {3'd0, read_color, read_pen}) : 11'd0;
+
+`ifdef V30_SIM_PROBES
+// Probe FAME FETCH: righe in cui il prefetcher NON ha finito la linea prima
+// del new_line successivo -> tile mancanti (BG: sentinella = colore solido).
+integer pf_starve = 0;
+integer pf_lines  = 0;
+integer pf_dump   = 0;
+always @(posedge clk) begin
+	if (gated_new_line) begin
+		pf_lines <= pf_lines + 1;
+		if (pf_state != PF_IDLE && pf_state != PF_DONE) begin
+			pf_starve <= pf_starve + 1;
+			if (pf_starve < 25)
+				$display("[pfstarve %m] linea#%0d INCOMPLETA: state=%0d col=%0d", pf_lines, pf_state, tile_col_pf);
+		end
+	end
+	// Dump indici tile della riga scelta: mostra se il blocco solido viene da
+	// un run di codici uguali/zero in VRAM (contenuto) o da altro.
+	if (pf_state == PF_VRAM_W2 && vpos == 9'd80 && pf_dump < 60) begin
+		pf_dump <= pf_dump + 1;
+		$display("[tiledump %m] col=%0d idx=%03h clr=%0d vram=%04h", tile_col_pf, vram_data[11:0], vram_data[15:12], vram_data);
+	end
+end
+final $display("[pfstarve %m] TOTALE righe incomplete: %0d su %0d", pf_starve, pf_lines);
+`endif
 
 endmodule

@@ -23,7 +23,7 @@ module raiden_sprite_ddr_client
 
 	// Read port (32-bit sprite fetch via cache 8-byte)
 	input  [27:0] rdaddr,
-	output reg [31:0] dout = 0,
+	output reg [63:0] dout = 0,   // parola DDR intera (la cache sceglie la meta')
 	input         rd_req,
 	output reg    rd_ack = 0,
 
@@ -85,12 +85,12 @@ always @(posedge clk) begin
 				else if (rd_req != rd_ack) begin
 					if (cache_addr[27:3] == rdaddr[27:3]) begin
 						rd_ack <= rd_req;
-						dout   <= ram_q[{rdaddr[2], 5'b00000} +: 32];
+						dout   <= ram_q;
 					end
 					else if ((cache_addr[27:3] + 1'd1) == rdaddr[27:3]) begin
 						rd_ack      <= rd_req;
 						ram_q       <= next_q;
-						dout        <= next_q[{rdaddr[2], 5'b00000} +: 32];
+						dout        <= next_q;
 						cache_addr  <= {rdaddr[27:3], 3'b000};
 						ram_address <= {rdaddr[27:3] + 1'd1, 3'b000};
 						ram_read    <= 1;
@@ -115,7 +115,7 @@ always @(posedge clk) begin
 
 			2: if (DDRAM_DOUT_READY) begin
 					ram_q  <= DDRAM_DOUT;
-					dout   <= DDRAM_DOUT[{rdaddr[2], 5'b00000} +: 32];
+					dout   <= DDRAM_DOUT;
 					rd_ack <= rd_req;
 					state  <= 3;
 				end

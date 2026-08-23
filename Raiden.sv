@@ -149,6 +149,7 @@ wire pause = pause_toggle;  // solo pad (OSD pause rimosso, pattern Darius2)
 // Necessario per evitare race a metà bus cycle / scanline / DDR3 transaction.
 wire ss_busy;       // savestate DMA in corso — da save_state_data.busy
 wire ss_mgr_pause;  // richiesta pausa dal coordinatore (raiden_ss_manager)
+wire ss_slot_empty; // 1 = l'ultimo load ha trovato uno slot mai scritto
 // Coordinamento frame-aligned (pattern BoogieWings/F2): alla pressione il manager
 // alza ss_mgr_pause SUBITO; paused_safe sale al vblank successivo (confine frame);
 // solo allora il manager pulsa il DMA. ss_mgr_pause resta alto per tutto il DMA
@@ -168,6 +169,14 @@ always @(posedge clk_sys) begin
 			paused_safe_r <= 1'b1;
 		else if (VBlank && !vblank_prev_safe)
 			paused_safe_r <= pause | ss_mgr_pause;
+		// RELEASE post-LOAD: il save avviene DENTRO il vblank -> il restore
+		// riporta il video timing dentro il vblank e la pausa lo tiene fermo
+		// -> VBlank resta alto FISSO -> il fronte di salita non arriva mai ->
+		// pausa eterna (deadlock trovato in sim scene; vale anche su HW: il
+		// SAVE non lo soffre perche' non ripristina il video). Rilascio anche
+		// a VBlank a LIVELLO: siamo comunque al confine frame, stessa garanzia.
+		else if (paused_safe_r && VBlank && !pause && !ss_mgr_pause)
+			paused_safe_r <= 1'b0;
 	end
 end
 wire paused_safe = paused_safe_r;
@@ -177,8 +186,6 @@ assign HDMI_BOB_DEINT = 0;
 
 assign AUDIO_S = 1;  // signed audio
 wire signed [15:0] game_audio_l, game_audio_r;
-assign AUDIO_L = game_audio_l;
-assign AUDIO_R = game_audio_r;
 assign AUDIO_MIX = 0;
 
 assign LED_DISK = 0;
@@ -204,34 +211,51 @@ wire signed [9:0] osd_txt_yoff = 10'sd0;
 wire signed [9:0] osd_bg_xoff  = osd_l0_xoff;
 wire signed [9:0] osd_bg_yoff  = osd_l0_yoff;
 
+wire [21:0] gamma_bus;   // OSD framework <-> gamma_fast (inout, decodifica interna)
 `include "build_id.v"
 localparam CONF_STR = {
 	"Raiden;SS3E000000:200000;",
 	"-;",
-	// [PUBLIC] Savestate nascosto dall'OSD finché non fixiamo l'audio SS — riattivare togliendo i commenti:
-	//"O[106:105],Savestate Slot,1,2,3,4;",
-	//"R[107],Save state (Alt-F1);",
-	//"R[108],Restore state (F1);",
-	//"-;",
+	"O[109:105],Savestate Slot,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32;",
+	"R[110],Save state (Alt-F1);",
+	"R[111],Restore state (F1);",
+	"-;",
 	"P1,Video;",
 	"P1O[122:121],Aspect ratio,Original,Full Screen,[ARC1],[ARC2];",
 	"P1O[7:5],Scale,Normal,V-Integer,HV-Integer,Narrower HV-Integer;",
 	"P1O[2:1],Rotate,No,CCW (TATE),CW;",
 	"P1O[3],Flip 180,Off,On;",
-	"P1O[19],Refresh Rate,Original 59.4Hz,60Hz;",
-	"P1O[66:62],CRT H-Size,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
-	"P1O[104:98],CRT H-Position,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,+32,+33,+34,+35,+36,+37,+38,+39,+40,+41,+42,+43,+44,+45,+46,+47,+48,-48,-47,-46,-45,-44,-43,-42,-41,-40,-39,-38,-37,-36,-35,-34,-33,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
-	"P1O[97:92],Analog VGA H-Shift,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,+32,+33,+34,+35,+36,+37,+38,+39,+40,+41,+42,+43,+44,+45,+46,+47,+48,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
-	"P1O[61:56],Analog VGA V-Shift,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"P1O[19],Refresh Rate,Original 59.6Hz,60Hz;",
+	"P1O[112],CRT Adjust,Off,On;",
+	"H1P1O[66:62],CRT H-Size,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[104:98],CRT H-Position,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,+32,+33,+34,+35,+36,+37,+38,+39,+40,+41,+42,+43,+44,+45,+46,+47,+48,-48,-47,-46,-45,-44,-43,-42,-41,-40,-39,-38,-37,-36,-35,-34,-33,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[61:56],CRT V-Shift,0,+1,+2,+3,+4,+5,+6,+7,+8,+9,+10,+11,+12,+13,+14,+15,+16,+17,+18,+19,+20,+21,+22,+23,+24,+25,+26,+27,+28,+29,+30,+31,-32,-31,-30,-29,-28,-27,-26,-25,-24,-23,-22,-21,-20,-19,-18,-17,-16,-15,-14,-13,-12,-11,-10,-9,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[116:113],CRT V-Size,0,+1,+2,+3,+4,+5,+6,+7,-8,-7,-6,-5,-4,-3,-2,-1;",
+	"H1P1O[117],CRT V-Size Mode,PVM,Cabinet;",
 	"-;",
 	"O[18],Clean Pause,Off,On;",
+	"O[4],CPU Boost,Off,On;",
 	"O[30],Player,1P,2P;",
 	"-;",
 	"DIP;",
 	"-;",
 	"P3,Audio;",
+	"O[83],Audio Filter,On,Off;",
 	"P3O[87:84],FM Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
 	"P3O[91:88],ADPCM Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[70:67],OKI Ch1 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[74:71],OKI Ch2 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[78:75],OKI Ch3 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[82:79],OKI Ch4 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[11:8],FM Ch1 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[15:12],FM Ch2 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[23:20],FM Ch3 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[27:24],FM Ch4 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[39:36],FM Ch5 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[43:40],FM Ch6 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[47:44],FM Ch7 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[51:48],FM Ch8 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
+	"P3O[55:52],FM Ch9 Volume,Default,Mute,25%,50%,75%,100%,125%,150%,200%,250%,300%,400%,500%,700%,1000%;",
 	"-;",
 	"T[0],Reset;",
 	"R[0],Reset and close OSD;",
@@ -261,11 +285,11 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 	.clk_sys(clk_sys),
 	.HPS_BUS(HPS_BUS),
 	.EXT_BUS(),
-	.gamma_bus(),
+	.gamma_bus(gamma_bus),
 	.forced_scandoubler(forced_scandoubler),
 	.buttons(buttons),
 	.status(status),
-	.status_menumask(16'd0),
+	.status_menumask({14'd0, ~status[112], 1'b0}),  // H1: gruppo CRT Adjust visibile solo se On
 	.ps2_key(ps2_key),
 	.joystick_0(joy0),
 	.joystick_1(joy1),
@@ -279,7 +303,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1)) hps_io
 
 // === Savestate UI: trigger save/load da tasti (Alt+F1-F4 / F1-F4), gamepad, OSD ===
 wire       ss_save, ss_load;
-wire [1:0] ss_slot;
+wire [4:0] ss_slot;        // 32 slot: [4:3]=regione (file .ss1-.ss4), [2:0]=sotto-slot
 wire [15:0] joy_all = joy0 | joy1;
 savestate_ui #(.INFO_TIMEOUT_BITS(25)) u_ss_ui (
 	.clk         (clk_sys),
@@ -293,9 +317,9 @@ savestate_ui #(.INFO_TIMEOUT_BITS(25)) u_ss_ui (
 	.joyStart    (joy_all[12]),
 	.joyRewind   (1'b0),
 	.rewindEnable(1'b0),
-	.status_slot (status[106:105]),
+	.status_slot (status[109:105]),
 	.autoincslot (1'b0),
-	.OSD_saveload(status[108:107]),  // R[107]=save, R[108]=restore
+	.OSD_saveload(status[111:110]),  // R[110]=save, R[111]=restore
 	.ss_save     (ss_save),
 	.ss_load     (ss_load),
 	.ss_info_req (),
@@ -303,6 +327,17 @@ savestate_ui #(.INFO_TIMEOUT_BITS(25)) u_ss_ui (
 	.statusUpdate(),
 	.selected_slot(ss_slot)
 );
+
+// Board select — via MRA region index=1 (mod byte), NON dai DIP.
+// CRITICO: index=1 viene scaricato dall'HPS PRIMA dei ROM (index=0), mentre i
+// DIP (index=254) arrivano DOPO: board_raidenb e' gia' valido durante il
+// download, quindi il bypass del decrypt V30 agisce dal primo byte di ROM.
+// 00 (o regione assente) = set attuali; 01 = raidenb (World set 2, newer hw).
+// NON resettato dal game reset (latch solo su ioctl_wr) → robusto ai soft-reset.
+reg board_raidenb = 1'b0;
+always @(posedge clk_sys)
+	if (ioctl_wr_raw && (ioctl_index_raw == 16'd1))
+		board_raidenb <= ioctl_dout_raw[0];
 
 // raiden_decrypt — applica MAME init_decryption() al volo durante download.
 // Pass-through completo per ioctl_addr/wr/index/download; modifica solo ioctl_dout
@@ -313,6 +348,7 @@ wire        ioctl_wr;
 wire [26:0] ioctl_addr;
 wire [15:0] ioctl_dout;
 raiden_decrypt u_decrypt (
+	.bypass            (board_raidenb),
 	.ioctl_addr_in     (ioctl_addr_raw),
 	.ioctl_dout_in     (ioctl_dout_raw),
 	.ioctl_wr_in       (ioctl_wr_raw),
@@ -354,7 +390,14 @@ wire [7:0] coin_input = {6'd0, jp2[11], jp1[11]};
 
 // DIP switches — loaded from MRA via ioctl (index 254)
 // Active-LOW: default "FF,FF" = all OFF = all 1s
+// SIM_FORCE_DIP (solo sim): valore iniziale forzato — serve per accendere il
+// flip (SW1:7=0 → 7FFF) in simulazione, dove la sezione DIP non viene
+// consegnata. Zero impatto HW: il define non esiste nella build Quartus.
+`ifdef SIM_FORCE_DIP
+reg [15:0] dip_sw = `SIM_FORCE_DIP;
+`else
 reg [15:0] dip_sw = 16'hFFFF;
+`endif
 always @(posedge clk_sys)
 	if (ioctl_wr && (ioctl_index == 16'd254) && !ioctl_addr[26:1])
 		dip_sw <= ioctl_dout;
@@ -382,6 +425,16 @@ always @(posedge clk_sys) begin
 	else if (reset_hold_cnt != 22'd0) reset_hold_cnt <= reset_hold_cnt - 22'd1;
 end
 wire reset = (reset_hold_cnt != 22'd0);
+`ifdef V30_SIM_PROBES
+// spia sim: quale sorgente tiene il reset (RESET, OSD, ~pll_locked, download)
+integer dbg_rst_c = 0;
+always @(posedge clk_sys) begin
+	dbg_rst_c <= dbg_rst_c + 1;
+	if (dbg_rst_c % 500000 == 0)
+		$display("[rst] clk%0d reset=%b RESET=%b osd=%b btn=%b pll=%b dl=%b",
+		         dbg_rst_c, reset, RESET, status[0], buttons[1], pll_locked, ioctl_download);
+end
+`endif
 // Bridge reset: ONLY pll_locked — bridge must run during download
 // (revert dd86f8b: includere user reset causa mismatch sdram_ack/sdram_req,
 // SDRAM controller non si resetta → bridge in reset vs SDRAM running → stuck)
@@ -426,7 +479,13 @@ sdram sdram_ctrl
 
 	.init(~pll_locked),
 	.clk(clk_sys),
-	.prio_mode(status[35:34]),
+	// CPU-first FISSO (mode 2), sicuro per costruzione: 2 V30 = max 1 txn/32clk
+	// l'uno (ciclo bus 4T@10MHz) = max 50% slot SDRAM anche a miss 100%; il video
+	// worst-case usa ~25-31% della scanline -> mai affamato (margine ~2x). Con
+	// le CPU 0-wait anche sui miss spariscono i rallentamenti (assenti su PCB)
+	// -> niente sfasamenti main<->sub -> niente leak sprite. (status[35:34] era
+	// senza voce OSD = morto.)
+	.prio_mode(2'd2),
 	.ready(sdram_ready),
 
 	.addr0(sd_addr0), .wrl0(sd_wrl0), .wrh0(sd_wrh0),
@@ -454,53 +513,47 @@ wire [15:0] game_main_data, game_sub_data;
 // Audio Z80 ROM removed from SDRAM — will use BRAM when audio implemented
 wire        game_main_ready, game_sub_ready;
 
-// BYPASS rom_cache (pattern WonderSwan_MiSTer): CPU bus_read direttamente sul
-// bridge SDRAM. WonderSwan non usa cache — sdram controller registra dout, dato
-// stabile fino al prossimo accesso. La cache introduceva 1 ciclo di latenza
-// extra + cpu_ready pulse 1 ciclo che la CPU V30 (10 MHz → ~9 cicli clk_sys
-// per ce) poteva facilmente perdere.
-wire [23:0] bridge_main_addr = game_main_addr;
-wire        bridge_main_req  = game_main_req;
+// (Storico: il vecchio bypass "pattern WonderSwan" era di un'era pre-latch-FSM;
+// oggi il ricevitore Main latcha il ready-pulse come il Sub -> cache ok.)
+// MAIN ROM via rom_cache (come il Sub): senza cache il Main fetcha DIRETTO da
+// SDRAM in arbitraggio contro grafica+OKI+miss Sub -> nelle scene pesanti viene
+// AFFAMATO -> rallentamenti (che MAME non ha) -> sfasamento timing main<->sub
+// -> leak slot sprite (i bug avvengono DURANTE i rallentamenti, verificato HW).
+// Il ricevitore Main ha lo stesso latch-FSM del Sub (main_top:128-152 =
+// sub_top:112-134): protocollo ready-pulse gia' provato con la cache su HW.
+wire [23:0] bridge_main_addr;
+wire        bridge_main_req;
 wire [15:0] bridge_main_data;
 wire        bridge_main_ready;
-assign game_main_data  = bridge_main_data;
-assign game_main_ready = bridge_main_ready;
+rom_cache #(.CACHE_BITS(13)) u_main_cache (
+	.clk(clk_sys), .reset(bridge_reset),
+	.cpu_addr(game_main_addr), .cpu_req(game_main_req),
+	.cpu_data(game_main_data), .cpu_ready(game_main_ready),
+	.sdram_addr(bridge_main_addr), .sdram_req(bridge_main_req),
+	.sdram_data(bridge_main_data), .sdram_ready(bridge_main_ready)
+);
 
-// SUB ROM in BRAM (256KB = 128K word). Caricata da ioctl_download nel range
-// MRA byte $060000-$09FFFF. Tenere bridge_sub_* connesso per compatibilità
-// ma SCOLLEGATO dal bridge SDRAM (Sub legge da BRAM diretta).
-wire [23:0] bridge_sub_addr = 24'd0;
-wire        bridge_sub_req  = 1'b0;
-wire [15:0] bridge_sub_data_unused;
-wire        bridge_sub_ready_unused;
+// SUB ROM in SDRAM (porta 2), non piu' in BRAM. Il download scrive gia' tutto
+// in SDRAM (Sub @ word offset SUB_BASE=0x030000); il Sub V30 legge via bridge
+// come il Main (READY/Tw per la latenza SDRAM). Rimosso il duplicato BRAM
+// (256KB = ~205 M10K liberati).
+wire [15:0] bridge_sub_data;
+wire        bridge_sub_ready;
+wire [23:0] sub_cache_sdram_addr;
+wire        sub_cache_sdram_req;
 
-// Sub ROM BRAM 256KB (split lo/hi byte 8-bit per inferenza M10K)
-(* ramstyle = "M10K,no_rw_check" *) reg [7:0] sub_rom_lo [0:131071];
-(* ramstyle = "M10K,no_rw_check" *) reg [7:0] sub_rom_hi [0:131071];
-
-// Download Sub ROM: range MRA byte $060000-$09FFFF (256KB)
-// word index = (byte_addr - $060000) / 2 = ioctl_addr[17:1] - $30000
-wire        sub_dl_wr     = ioctl_download && ioctl_wr && (ioctl_index == 16'd0) &&
-                             (ioctl_addr >= 27'h060000) && (ioctl_addr < 27'h0A0000);
-wire [16:0] sub_dl_offset = ioctl_addr[17:1] - 17'h30000;
-always @(posedge clk_sys) begin
-	if (sub_dl_wr) begin
-		sub_rom_lo[sub_dl_offset] <= ioctl_dout[7:0];
-		sub_rom_hi[sub_dl_offset] <= ioctl_dout[15:8];
-	end
-end
-
-// Read porta CPU Sub (word-aligned)
-reg [15:0] sub_bram_rdata;
-wire [16:0] sub_word_idx = game_sub_addr[17:1];  // 17-bit word idx → 128K word
-always @(posedge clk_sys) begin
-	sub_bram_rdata <= {sub_rom_hi[sub_word_idx], sub_rom_lo[sub_word_idx]};
-end
-// ready: 1 ciclo dopo cpu_req (BRAM 1-cycle latency).
-reg sub_req_d;
-always @(posedge clk_sys) sub_req_d <= game_sub_req;
-assign game_sub_data  = sub_bram_rdata;
-assign game_sub_ready = sub_req_d;
+// rom_cache: la maggior parte dei fetch del Sub in 1 ciclo (niente SDRAM) ->
+// il Sub non ruba banda alla grafica -> niente nero da contesa.
+// CACHE_BITS 13 = 16KB (8192x16): miss rarissimi -> timing Sub quasi-BRAM.
+// Con 9 (1KB) il thrash nelle scene pesanti rallentava/jitterava il Sub ->
+// race mailbox main<->sub -> leak slot sprite (detriti fissi a schermo, stage 3).
+rom_cache #(.CACHE_BITS(13), .FAST_HIT(1)) u_sub_cache (   // boost sub: hit combinatorio (main FAST_HIT=0, bit-identico)
+	.clk(clk_sys), .reset(bridge_reset),
+	.cpu_addr(game_sub_addr), .cpu_req(game_sub_req),
+	.cpu_data(game_sub_data), .cpu_ready(game_sub_ready),
+	.sdram_addr(sub_cache_sdram_addr), .sdram_req(sub_cache_sdram_req),
+	.sdram_data(bridge_sub_data), .sdram_ready(bridge_sub_ready)
+);
 
 sdram_bridge bridge
 (
@@ -529,11 +582,11 @@ sdram_bridge bridge
 	.main_data(bridge_main_data),
 	.main_ready(bridge_main_ready),
 
-	// Sub V30 ROM ora in BRAM (vedi sopra), porta bridge SDRAM scollegata.
-	.sub_byte_addr(bridge_sub_addr),
-	.sub_req(bridge_sub_req),
-	.sub_data(bridge_sub_data_unused),
-	.sub_ready(bridge_sub_ready_unused),
+	// Sub V30 ROM in SDRAM (porta 2) via rom_cache.
+	.sub_byte_addr(sub_cache_sdram_addr),
+	.sub_req(sub_cache_sdram_req),
+	.sub_data(bridge_sub_data),
+	.sub_ready(bridge_sub_ready),
 
 	// OKI ADPCM ROM (port 3)
 	.oki_byte_addr(oki_rom_addr),
@@ -592,11 +645,40 @@ wire [7:0] sr_b19 = scroll_words_flat[25*16+0 +: 8];   // scroll_ram[0x19] low
 wire [7:0] sr_b1A = scroll_words_flat[26*16+0 +: 8];   // scroll_ram[0x1A] low
 wire [7:0] sr_b11 = scroll_words_flat[17*16+0 +: 8];   // scroll_ram[0x11] low
 wire [7:0] sr_b12 = scroll_words_flat[18*16+0 +: 8];   // scroll_ram[0x12] low
-wire [15:0] map_xscroll_l0 = {4'd0, sr_b09[7:4], sr_b0A[6:0], sr_b0A[7]};  // BG X
-wire [15:0] map_yscroll_l0 = {4'd0, sr_b01[7:4], sr_b02[6:0], sr_b02[7]};  // BG Y
-wire [15:0] map_xscroll_l1 = {4'd0, sr_b19[7:4], sr_b1A[6:0], sr_b1A[7]};  // FG X
-wire [15:0] map_yscroll_l1 = {4'd0, sr_b11[7:4], sr_b12[6:0], sr_b12[7]};  // FG Y
+// raidenb: gli scroll arrivano dal CRTC come word intere (raiden.cpp:407-410,
+// nessuna ricomposizione byte) — mux sul board select.
+//
+// FLIP su raidenb — centratura BG/FG. L'algebra MAME completa (tilemap.cpp:
+// scroll trasformato + CONTENUTO mirrorato) dimostra che il contratto di
+// rotazione 180° si soddisfa con lo scroll RAW: nessuna negazione. Col nostro
+// schema (mirror della riga/colonna + scroll raw) resta solo un BIAS COSTANTE
+// per asse, dovuto agli offset di pipeline (+3 X, read-ahead, 222 vs 223).
+// I set vecchi non lo vedono: il gioco compensa nello scroll che scrive.
+// Su raidenb (scroll raw dal CRTC) il bias va aggiunto qui, SOLO in flip.
+// Valori misurati con flip-vs-unflip ruotato in sim (utente su HW: ~2px/asse).
+// Catena misurata (2026-08-21): (1) utente su HW: fondale flippato 2px verso
+// SUD (asse di scroll); (2) sim: il terreno avanza verso x=0 ⇒ nord = x=255;
+// (3) linebuf[i]=texture(i-1+S+K) (inchiodata dalla correttezza unflipped su
+// HW) ⇒ read flippato: posizione contenuto p = 255+S+K-T ⇒ dp/dS = +1.
+// Servono +2 verso nord ⇒ BIAS_X = +2. Le compensazioni di pipeline K si
+// elidono (stanno nella stessa relazione che rende giusto l'unflipped).
+localparam signed [15:0] RB_FLIP_BIAS_X = 16'sd0;  // il 2px era il read-side (5dee128), non lo scroll
+localparam signed [15:0] RB_FLIP_BIAS_Y = 16'sd0;
 wire        ctrl_bg_en, ctrl_fg_en, ctrl_tx_en, ctrl_sp_en, ctrl_flipscreen;
+wire        flip_scr_pre = ctrl_flipscreen;  // pre-pack, per il mux scroll
+wire [15:0] crtc_bg_x, crtc_bg_y, crtc_fg_x, crtc_fg_y;
+wire [15:0] crtc_bg_x_eff = flip_scr_pre ? (crtc_bg_x + 16'(RB_FLIP_BIAS_X)) : crtc_bg_x;
+wire [15:0] crtc_bg_y_eff = flip_scr_pre ? (crtc_bg_y + 16'(RB_FLIP_BIAS_Y)) : crtc_bg_y;
+wire [15:0] crtc_fg_x_eff = flip_scr_pre ? (crtc_fg_x + 16'(RB_FLIP_BIAS_X)) : crtc_fg_x;
+wire [15:0] crtc_fg_y_eff = flip_scr_pre ? (crtc_fg_y + 16'(RB_FLIP_BIAS_Y)) : crtc_fg_y;
+wire [15:0] map_xscroll_l0 = board_raidenb ? crtc_bg_x_eff
+                           : {4'd0, sr_b09[7:4], sr_b0A[6:0], sr_b0A[7]};  // BG X
+wire [15:0] map_yscroll_l0 = board_raidenb ? crtc_bg_y_eff
+                           : {4'd0, sr_b01[7:4], sr_b02[6:0], sr_b02[7]};  // BG Y
+wire [15:0] map_xscroll_l1 = board_raidenb ? crtc_fg_x_eff
+                           : {4'd0, sr_b19[7:4], sr_b1A[6:0], sr_b1A[7]};  // FG X
+wire [15:0] map_yscroll_l1 = board_raidenb ? crtc_fg_y_eff
+                           : {4'd0, sr_b11[7:4], sr_b12[6:0], sr_b12[7]};  // FG Y
 wire [15:0] map_ctrl_l0 = {9'd0, 1'b0, ctrl_flipscreen,
                             ctrl_sp_en, ctrl_tx_en, ctrl_fg_en, 1'b0, ctrl_bg_en};
 
@@ -670,13 +752,27 @@ assign pal_b_b = {pal_b4, pal_b4};
 // MRA layout audiocpu: 0x0A0000-0x0AFFFF (64KB raw byte-pack)
 // OKI ROM: SDRAM @ OKI_BASE (oki_rom_addr/data/ok via SDRAM bridge)
 // Coin button (joy[11]) → Z80 0x4013 → sub2main → main 0xA0004 → coin_credit
-Raiden_audio_z80 #(.SS_IDX_ZRAM(10)) u_audio (
+Raiden_audio_z80 #(.SS_IDX_ZRAM(10), .SS_IDX_Z80(12), .SS_IDX_YMSH(13), .SS_IDX_GLUE(14)) u_audio (
 	.clk           (clk_sys),
 	.reset         (reset),
 	.pause         (paused_safe),
 	.clk_sel       (2'd0),         // legacy, ignored
+	.z80_decrypt_en(~board_raidenb), // raidenb: rai6.u212 in chiaro, niente sei80bu
 	.fm_vol_sel    (status[87:84]),
 	.oki_vol_sel   (status[91:88]),
+	.oki_ch_vol_sel0 (status[70:67]),
+	.oki_ch_vol_sel1 (status[74:71]),
+	.oki_ch_vol_sel2 (status[78:75]),
+	.oki_ch_vol_sel3 (status[82:79]),
+	.fm_ch_vol_sel0 (status[11:8]),
+	.fm_ch_vol_sel1 (status[15:12]),
+	.fm_ch_vol_sel2 (status[23:20]),
+	.fm_ch_vol_sel3 (status[27:24]),
+	.fm_ch_vol_sel4 (status[39:36]),
+	.fm_ch_vol_sel5 (status[43:40]),
+	.fm_ch_vol_sel6 (status[47:44]),
+	.fm_ch_vol_sel7 (status[51:48]),
+	.fm_ch_vol_sel8 (status[55:52]),
 	.ioctl_download(ioctl_download),
 	.ioctl_wr      (ioctl_wr),
 	.ioctl_addr    (ioctl_addr),
@@ -695,18 +791,125 @@ Raiden_audio_z80 #(.SS_IDX_ZRAM(10)) u_audio (
 	.oki_rom_ok    (oki_rom_ok),
 	.audio_l       (game_audio_l),
 	.audio_r       (game_audio_r),
-	.ss_zram       (ssb[10])
+	.ss_zram       (ssb[10]),
+	.ss_z80        (ssb[12]),
+	.ss_ymsh       (ssb[13]),
+	.ss_glue       (ssb[14]),
+	.z80_ss_ready  (z80_ss_ready)
 );
+
+// ─── FILTRO DI USCITA (Arcade LPF 6 kHz 2nd order) ───────────────────────
+// L'uscita del MiSTer e' piatta; il PCB reale ha uno stadio analogico che
+// taglia gli alti. La curva scelta confrontando con le registrazioni dalla
+// scheda e' "Arcade LPF 6khz 2nd.txt" dei filtri di sistema, qui CUCITA
+// nell'RTL cosi' ogni utente ce l'ha di serie senza file esterni.
+// Voce OSD "Audio Filter" On/Off: status[83]=0 -> On (default).
+//
+// Coefficienti presi dal file, invariati:
+//   Sampling Frequency 7056000 ; Base gain 0.00003952949005309181
+//   X0=2  X1=1  X2=0 ; Y0=-1.99244411238133389830 ; Y1=0.99247255086338648233
+// (il file non ha Y2 -> 0)
+//
+// Il `ce` e' generato con LO STESSO accumulatore del framework
+// (sys/audio_out.v: cnt += flt_rate*2, confronto con CLK_RATE), quindi la
+// frequenza media e' identica e la risposta e' la stessa, non un'approssimazione.
+localparam [31:0] FLT_RATE_HZ = 32'd7056000;   // Sampling Frequency del file
+localparam [31:0] CLK_RATE_HZ = 32'd80000000;  // clk_sys
+
+reg flt_ce;
+always @(posedge clk_sys) begin
+	reg [31:0] flt_cnt = 0;
+	flt_ce  = 0;
+	flt_cnt = flt_cnt + {FLT_RATE_HZ[30:0], 1'b0};
+	if (flt_cnt >= CLK_RATE_HZ) begin
+		flt_cnt = flt_cnt - CLK_RATE_HZ;
+		flt_ce  = 1;
+	end
+end
+
+// sample_ce = frequenza di uscita del filtro (48 kHz), stesso metodo
+localparam [31:0] SND_RATE_HZ = 32'd48000;
+reg snd_ce;
+always @(posedge clk_sys) begin
+	reg [31:0] snd_cnt = 0;
+	snd_ce  = 0;
+	snd_cnt = snd_cnt + SND_RATE_HZ;
+	if (snd_cnt >= CLK_RATE_HZ) begin
+		snd_cnt = snd_cnt - CLK_RATE_HZ;
+		snd_ce  = 1;
+	end
+end
+
+wire [15:0] flt_audio_l, flt_audio_r;
+IIR_filter #(
+	.use_params(1),
+	.stereo    (1),
+	.coeff_x   (0.00003952949005309181),
+	.coeff_x0  (2),
+	.coeff_x1  (1),
+	.coeff_x2  (0),
+	.coeff_y0  (-1.99244411238133389830),
+	.coeff_y1  (0.99247255086338648233),
+	.coeff_y2  (0)
+) u_audio_lpf (
+	.clk      (clk_sys),
+	.reset    (reset),
+	.ce       (flt_ce),
+	.sample_ce(snd_ce),
+	.cx (40'd0), .cx0(8'd0), .cx1(8'd0), .cx2(8'd0),
+	.cy0(24'd0), .cy1(24'd0), .cy2(24'd0),
+	.input_l  (game_audio_l),
+	.input_r  (game_audio_r),
+	.output_l (flt_audio_l),
+	.output_r (flt_audio_r)
+);
+
+wire audio_filter_off = status[83];
+assign AUDIO_L = audio_filter_off ? game_audio_l : flt_audio_l;
+assign AUDIO_R = audio_filter_off ? game_audio_r : flt_audio_r;
 
 // ── Isolatore OSD → CPU (2-FF sync, attributi preserve). ──
 // Aggiungere bit OSD altrove NON destabilizza più le CPU.
 wire        pause_iso;
 wire  [2:0] main_clk_sel_iso, sub_clk_sel_iso;
+// ── Sub CPU Boost: stesso interruttore O[4] del main ──────────────────────
+// Boost 16 MHz nominali (clk_sel 3; ~12.6 MHz effettivi, limite del percorso
+// memoria misurato a banco) applicato al SOLO sub e SOLO nella finestra di
+// lavoro su un comando: dall'ack (sub scrive [0x4000]=0, shared word 0) alla
+// scrittura dello status (sub scrive [0x4008], shared word 4). In quella
+// finestra il main e' in spin di sola lettura su [0x8008]: il boost accorcia
+// l'attesa del main senza toccare le fasi di handshake (protocollo a flag,
+// sempre a 10 MHz). Fuori finestra e con l'opzione Off: 10 MHz, bit-identico.
+// Misure (lista collisioni): piena 179%→142% del frame, mezza 67%→53%.
+// ── CPU Boost, comando UNICO (OSD O[4], default Off) ──────────────────────
+// Un solo interruttore accende ENTRAMBE le CPU: il main (qui sotto) e il sub
+// (piu' avanti, nella sua finestra comando->status). Prima erano due voci.
+// Il main gira sempre a 10 MHz: e' lui a fare la ISR che costruisce la lista
+// sprite, quindi quando la scena e' densa il collo puo' essere il main e
+// nessun boost del sub lo toglie. Misurato al banco del percorso main reale
+// (bridge+cache+SDRAM, stimolo lista piena): 8.09 clk/CE (9.9 MHz eff.) a
+// clk_sel 0 -> 5.31 clk/CE (15.1 MHz eff.) a clk_sel 3 = 1.53x, con CE totali
+// e stream delle 20.000 scritture IDENTICI (equivalenza funzionale).
+// NON gated: quando e' On il main va veloce sempre. Default Off perche' e' il
+// punto dove in passato un boost eccessivo aveva rotto le collisioni.
+wire [2:0] main_boost_sel = status[4] ? 3'd3 : 3'd0;
+
+wire sub_boost_en = status[4];
+reg  sub_cmd_busy;
+always @(posedge clk_sys) begin
+	if (reset) sub_cmd_busy <= 1'b0;
+	else if (sub_shared_cs && (sub_shared_we != 2'b00)) begin
+		if (sub_shared_addr == 11'd0 && sub_shared_wdata == 16'h0000) sub_cmd_busy <= 1'b1;  // ack comando
+		else if (sub_shared_addr == 11'd4 && sub_shared_wdata != 16'h0040) sub_cmd_busy <= 1'b0;  // status FINALE (0x0040 = marker 'in corso' scritto a inizio lavoro)
+	end
+end
+wire [2:0] sub_boost_sel = (sub_boost_en && sub_cmd_busy) ? 3'd3 : 3'd0;
+
 raiden_osd_iso u_osd_iso (
 	.clk              (clk_sys),
 	.pause_in         (paused_safe),
-	.main_clk_sel_in  (3'd0),   // CPU FISSA 10 MHz — scollegata dall'OSD (no overclock)
-	.sub_clk_sel_in   (3'd0),   // CPU FISSA 10 MHz — scollegata dall'OSD (no overclock)
+	.main_clk_sel_in  (main_boost_sel),  // 10 MHz, o 16 MHz nominali se CPU Boost=On
+	.sub_clk_sel_in   (sub_boost_sel),   // 10 MHz, o 16 MHz nom. nella finestra comando→status se CPU Boost=On
 	.pause_out        (pause_iso),
 	.main_clk_sel_out (main_clk_sel_iso),
 	.sub_clk_sel_out  (sub_clk_sel_iso)
@@ -720,9 +923,10 @@ raiden_osd_iso u_osd_iso (
 // continua a girare finché non raggiunge CPUSTAGE_IDLE (cpu_idle=1), POI si
 // congela (park). La cattura SS parte solo quando ENTRAMBE sono a confine.
 wire main_cpu_idle, sub_cpu_idle;
+wire z80_ss_ready;
 wire main_cpu_pause = pause_iso & main_cpu_idle;   // gira finché non è idle, poi park
 wire sub_cpu_pause  = pause_iso & sub_cpu_idle;
-wire cpus_ss_ready  = main_cpu_idle & sub_cpu_idle; // entrambe a confine = cattura sicura
+wire cpus_ss_ready  = main_cpu_idle & sub_cpu_idle & z80_ss_ready; // TUTTE le CPU a confine = cattura sicura
 
 // ── Main V30 (raiden_state::main_map) ──
 Raiden_main_top #(.SS_IDX_SPR(7), .SS_IDX_CPU(8)) u_main (
@@ -730,7 +934,8 @@ Raiden_main_top #(.SS_IDX_SPR(7), .SS_IDX_CPU(8)) u_main (
 	.reset            (reset),
 	.pause            (main_cpu_pause),
 	.cpu_idle         (main_cpu_idle),
-	.clk_sel          (main_clk_sel_iso),      // = 0 → 10 MHz fisso (no overclock OSD)
+	.board_raidenb    (board_raidenb),
+	.clk_sel          (main_clk_sel_iso),      // 0 = 10 MHz (default); 3 = 16 MHz nom. se CPU Boost=On
 	.p1_input         (p1_input),
 	.p2_input         (p2_input),
 	.dsw_input        (dip_sw),
@@ -746,6 +951,10 @@ Raiden_main_top #(.SS_IDX_SPR(7), .SS_IDX_CPU(8)) u_main (
 	.ctrl_sp_en       (ctrl_sp_en),
 	.ctrl_flipscreen  (ctrl_flipscreen),
 	.scroll_words_flat(scroll_words_flat),
+	.crtc_bg_x        (crtc_bg_x),
+	.crtc_bg_y        (crtc_bg_y),
+	.crtc_fg_x        (crtc_fg_x),
+	.crtc_fg_y        (crtc_fg_y),
 	.snd_cs           (snd_cs),
 	.snd_addr         (snd_addr),
 	.snd_wr           (snd_wr),
@@ -818,7 +1027,7 @@ wire        sub_dbg_palette_memrq;
 ///////////////////////   VIDEO   ///////////////////////////////
 
 // Raiden timing single-screen 320x224 @ 59.4 Hz (original) / 60.1 Hz.
-// Pixel clock 6 MHz = clk_sys/16. HTotal=384, VTotal=263 (59.4) o 260 (60Hz).
+// Pixel clock 5 MHz = clk_sys/16, HTotal=320 (linea 64 us = 15.625 kHz). VTotal=262 (59.63 Hz, Raiden PCB 1:1) o 260 (60Hz).
 wire ce_pix;
 wire HBlank, VBlank, HSync, VSync, video_de;
 wire [9:0] timing_hpos;
@@ -868,7 +1077,13 @@ wire [8:0]  vpos_for_pf   = flip_screen ? (9'd222 - vpos_logic) : vpos_logic;
 // Flip DIP service specchia le 256 colonne visibili (0..255): 255-hpos.
 // Era 319 (off-by-64, residuo vecchio H_TOTAL) → BG/FG flippati shiftati di
 // 64px. MAME raiden.cpp: tilemap set_flip_all su 256 colonne = 255-x.
-wire [9:0]  hpos_for_read = flip_screen ? (10'd255 - hpos_logic) : hpos_logic;
+// FIX flip 2px (2026-08-21): dal commit 5dee128 (M10K read-ahead, 31 lug, NON
+// nella 1.0 del 29 lug) il read-side legge linebuf[hpos+1] REGISTRATO. Unflipped
+// e' latency-free (pixel p <- linebuf[p]); flippato il +1 si somma all'indice
+// gia' specchiato: pixel p <- linebuf[(255-(p-1))+1] = linebuf[257-p] invece
+// di linebuf[255-p] (1.0) → BG/FG 2px fuori, entrambi i set, solo in flip.
+// Mirror 255 → 253: pixel p <- linebuf[(253-(p-1))+1] = linebuf[255-p] = 1.0.
+wire [9:0]  hpos_for_read = flip_screen ? (10'd253 - hpos_logic) : hpos_logic;
 
 // ── Text layer renderer (8x8, 4bpp, 64x32 grid) ─────────────────────────────
 // Char ROM caricata via ioctl da MRA: txtiles SDRAM region 0x040000..0x05FFFF
@@ -890,6 +1105,7 @@ Raiden_text_renderer u_text (
 	.clk          (clk_sys),
 	.reset        (reset),                 // include ioctl_download (fix garbage primo boot, vedi GundamSD c7ace01/1bdcd6c)
 	.ce_pix       (ce_pix),
+	.scan_cols    (board_raidenb),         // raidenb: text TILEMAP_SCAN_COLS
 	.decode_mode  (7'b0010000),  // HW verified 2026-05-19: Default + NIB
 	.hpos         (hpos_logic),           // NORMALE: flip fatto dentro su eff_x
 	.vpos         (vpos_logic),           // NORMALE: flip fatto dentro su eff_y
@@ -954,9 +1170,10 @@ Raiden_tile_layer #(
 ) u_bg (
 	.clk(clk_sys), .reset(reset), .ce_pix(ce_pix),
 	.decode_mode(bgfg_decode_mode_r),
-	.hpos(hpos_for_read), .vpos(vpos_for_pf),
+	.hpos(hpos_for_read), .vpos(vpos_logic[8:0]),  // vpos REALE: il mirror riga lo fa il layer (fix desync flip)
 	.de(video_de), .layer_en(map_ctrl_l0[0]),
 	.new_line(layer_new_line),
+	.flip_screen(flip_screen),
 	.scroll_x(bg_scroll_x), .scroll_y(bg_scroll_y),
 	.xoff(osd_bg_xoff), .yoff(osd_bg_yoff),
 	.gfx_bank(16'd0),
@@ -974,9 +1191,10 @@ Raiden_tile_layer #(
 ) u_fg (
 	.clk(clk_sys), .reset(reset), .ce_pix(ce_pix),
 	.decode_mode(bgfg_decode_mode_r),
-	.hpos(hpos_for_read), .vpos(vpos_for_pf),
+	.hpos(hpos_for_read), .vpos(vpos_logic[8:0]),  // vpos REALE (fix desync flip)
 	.de(video_de), .layer_en(map_ctrl_l0[2]),
 	.new_line(layer_new_line),
+	.flip_screen(flip_screen),
 	.scroll_x(fg_scroll_x), .scroll_y(fg_scroll_y),
 	.xoff(osd_fg_xoff), .yoff(osd_fg_yoff),
 	.gfx_bank(16'd0),
@@ -991,7 +1209,12 @@ Raiden_tile_layer #(
 // Elimina contesa SDRAM Port 0: SPR ora ha bus dedicato + cache 2-way.
 wire is_spr_dl     = ioctl_download && ioctl_wr && (ioctl_index == 16'd0) &&
                      (ioctl_addr >= 27'h1C0000) && (ioctl_addr < 27'h240000);
-wire [27:0] ddr_spr_waddr = {1'b0, ioctl_addr - 27'h1C0000};
+// REMAP layout sprite in DDR (renderer v2): dentro ogni tile da 128 byte le due
+// meta' (orig. +0 e +64) vengono messe ADIACENTI per riga: riga r del tile t a
+// t*128 + r*8 (byte 0-3 = meta' sx, 4-7 = meta' dx) → UNA lettura a 64 bit per
+// riga di sprite. Permutazione bit: o[6:0]={half,row[3:0],b[1:0]} → {row,half,b}.
+wire [26:0] spr_a_lin = ioctl_addr - 27'h1C0000;
+wire [27:0] ddr_spr_waddr = {1'b0, spr_a_lin[26:7], spr_a_lin[5:2], spr_a_lin[6], spr_a_lin[1:0]};
 
 // Toggle ioctl → DDRAM write
 reg ddr_we_req = 1'b0;
@@ -1014,7 +1237,7 @@ end
 
 // Cache ↔ DDR3 wires
 wire [27:0] ddr_rdaddr;
-wire [31:0] ddr_rdata;
+wire [63:0] ddr_rdata;
 wire        ddr_rd_req;
 wire        ddr_rd_ack;
 
@@ -1029,7 +1252,7 @@ ddr_if ddr_ss();      // savestate client (memory_stream) → gate → pin
 localparam SS_IDX_WORKRAM = 0;   // main work RAM (ram_lo/hi) — contiene lo score
 // slave: 0=workram,1=txt,2=scroll; 3=shared; 4=bg,5=fg,6=pal; 7=sprite;
 // 8=V30 main regs; 9=V30 sub regs; 10=z80_ram; 11=Sub work RAM.
-localparam SS_NSLAVES     = 12;
+localparam SS_NSLAVES     = 15;  // 12=regs Z80 (T80s REG/DIR), 13=shadow YM3812, 14=glue audio (ULTIMO: commit=replay)
 localparam SS_MS_COUNT    = 16;  // memory_stream COUNT (>= SS_NSLAVES, pot. di 2)
 
 // ss_busy dichiarato sopra (vicino a paused_safe che lo usa)
@@ -1047,6 +1270,7 @@ raiden_ss_manager u_ss_mgr (
 	.ss_load       (ss_load),
 	.paused_safe   (paused_safe & cpus_ss_ready),   // cattura/load SOLO con entrambe le V30 a confine istruzione
 	.ss_busy       (ss_busy),
+	.slot_empty    (ss_slot_empty),
 	.ss_pause      (ss_mgr_pause),
 	.write_start   (ss_mgr_wr),
 	.read_start    (ss_mgr_rd),
@@ -1063,6 +1287,7 @@ save_state_data #(.COUNT(SS_MS_COUNT)) u_ss_data (
 	.write_start (ss_mgr_wr),
 	.index       (ss_slot),
 	.busy        (ss_busy),
+	.slot_empty  (ss_slot_empty),   // load su slot mai scritto: niente reload CPU
 	.ssbus       (ssbus)
 );
 
@@ -1164,7 +1389,7 @@ wire [15:0] spr_vram_data;
 // Sprite ROM cache (DDR3 backend)
 wire [23:0] spr_cache_addr;
 wire        spr_cache_req_pulse;
-wire [31:0] spr_cache_data;
+wire [63:0] spr_cache_data;
 wire        spr_cache_valid;
 
 raiden_sprite_rom_cache #(
@@ -1245,8 +1470,14 @@ always @(posedge clk_sys) begin
 	end
 end
 wire [10:0] backdrop_pen = 11'h000;
+`ifdef V30_SIM_NOSPR
+// Isolamento layer (solo sim): sprite spenti -> cosa resta e' BG/FG/TXT.
+wire spr_above_fg = 1'b0;
+wire spr_above_bg = 1'b0;
+`else
 wire spr_above_fg = spr_opaque & (spr_pri >= 2'd2);   // pri=2,3 sopra FG
 wire spr_above_bg = spr_opaque & (spr_pri == 2'd1);   // pri=1 sopra BG (sotto FG)
+`endif
 
 // OSD palette base override: i 2 bit [9:8] del pen_index = palette region (256 entry).
 // Renderer originale produce: BG=0x0xx, FG=0x1xx, SPR=0x2xx, TXT=0x3xx.
@@ -1319,116 +1550,243 @@ pause_overlay u_pause_ovl (
 	.rgb_b_out   (av_b)
 );
 
-// ── Analog H-Shift / V-Shift / H-Size (pattern Blood Bros) ───────────────────
-// Agiscono SOLO sull'uscita analogica: comprimono/spostano l'immagine senza
-// toccare pixel clock né sync (HSync/refresh nativi intatti, zero jitter).
+// ── CRT Adjust + CRT V-Size (moduli della repo MiSTer-CRT-Adjust) ───────────
+// Catena: video nativo → crt_vsize → crt_adjust → OSD/DAC. Integrazione
+// CORE-SIDE: non tocca un byte di sys/. Da spento la catena viene scavalcata
+// del tutto, quindi l'immagine e' quella nativa senza nemmeno la latenza.
+// Nota: con CRT Adjust On anche l'HDMI segue la regolazione (e' la
+// contropartita nota del core-side); per un HDMI intatto si lascia Off.
 localparam int H_TOTAL_RD = 320;
-localparam int V_TOTAL_RD = 263;
+localparam int V_TOTAL_RD = 262;   // = V_TOTAL "Original" (59.63 Hz); in modo 60Hz (260) lo shift V analogico resta approssimato come prima
+
+// CRT Adjust (OSD P1O[112], default Off), come nei core recenti: da spento il
+// gruppo e' nascosto nel menu (maschera H1) E i valori sono forzati a neutro,
+// cioe' bypass nativo — nessuna regolazione agisce finche' non lo accendi.
+// Regola 1.6: con lo scandoubler attivo il CE pixel raddoppia e la base del
+// generatore di lettura non e' piu' valida -> si spegne tutto il gruppo.
+wire crt_adj_on = status[112] & ~(|status[7:5]) & ~forced_scandoubler;
 
 // H-Size: unico controllo bidirezionale (status[66:62], two's complement 5-bit):
 //   0        = nativo (bypass)
 //   +1..+15  = enlarge (immagine piu' larga)  → read piu' lento (quarti di ciclo)
 //   -1..-16  = shrink  (immagine piu' stretta) → read piu' veloce
-// Step = 1 quarto di ciclo = 1.56% (vedi accumulatore rd_acc sotto). Modulo
-// STANDARD applicabile a tutti i core: un solo controllo enlarge↔shrink.
+// Step = 1 quarto di ciclo = 1.56% (vedi accumulatore rd_acc sotto): la base
+// del generatore di lettura si dimensiona sul rapporto clk/pixel del core
+// (80/5 = 16 cicli per pixel → 64 quarti).
 reg  signed [4:0] hsize_s;
-always @(posedge clk_sys) if (ce_pix) hsize_s <= $signed(status[66:62]);
-wire hsize_active = (hsize_s != 5'sd0);
+always @(posedge clk_sys) if (ce_pix) hsize_s <= crt_adj_on ? $signed(status[66:62]) : 5'sd0;
 // H-Position: sposta il contenuto (non il sync). Signed ±48: >0 a destra, <0 a
 // sinistra. Non desincronizza (HSync intatto). Bitfield status[104:98] (7 bit):
-// 0..48 = +0..+48 ; 79..127 = -48..-1 (encoding come H-Shift).
+// 0..48 = +0..+48 ; 79..127 = -48..-1 (wrap a 128).
 reg  [6:0] hsize_hoff_d;
-always @(posedge clk_sys) if (ce_pix) hsize_hoff_d <= status[104:98];
+always @(posedge clk_sys) if (ce_pix) hsize_hoff_d <= crt_adj_on ? status[104:98] : 7'd0;
+// H-Position: il menu salva l'INDICE nella lista, e la lista ha 97 voci
+// (0, +1..+48, -48..-1). Il wrap va quindi fatto sulla LUNGHEZZA DELLA LISTA.
+// Col wrap a 128 (com'era) il lato negativo era tutto sbagliato: la voce "-1"
+// valeva -32 px, e infatti sull'hardware l'immagine SALTAVA di 32 pixel al
+// primo scatto invece di spostarsi di uno. Difetto latente da sempre, non
+// visto perche' il lato positivo e' corretto. Verificato su HW il 2026-08-23.
 wire signed [8:0] hsize_hoffset = (hsize_hoff_d <= 7'd48)
 	? $signed({2'b0, hsize_hoff_d})
-	: $signed({2'b0, hsize_hoff_d}) - 9'sd128;
+	: $signed({2'b0, hsize_hoff_d}) - 9'sd97;
 
-// H-Shift: bitfield 0..48 = +0..+48 (destra), 49..63 = -15..-1 (status[97:92]).
-reg [5:0] osd_vga_hshift_d;
-always @(posedge clk_sys) if (ce_pix) osd_vga_hshift_d <= status[97:92];
-wire [8:0] hshift_tap = (osd_vga_hshift_d <= 6'd48)
-	? {3'd0, osd_vga_hshift_d}
-	: (9'(H_TOTAL_RD) - (9'd64 - {3'd0, osd_vga_hshift_d}));
-reg [H_TOTAL_RD-1:0] hsync_shreg;
-always @(posedge clk_sys) if (ce_pix) hsync_shreg <= {hsync_shreg[H_TOTAL_RD-2:0], HSync};
-reg vga_hs_reg;
-always @(posedge clk_sys) if (ce_pix)
-	vga_hs_reg <= (hshift_tap == 9'd0) ? HSync : hsync_shreg[hshift_tap - 9'd1];
+// H-Shift dello SYNC: RIMOSSO. Era il controllo che spostava l'HSync e poteva
+// far perdere l'aggancio al monitor; l'H-Position (che sposta il CONTENUTO,
+// sopra) fa lo stesso lavoro senza toccare il sync. Il modulo aggiornato usa
+// infatti HPOS_CONTENTSHIFT.
 
 // V-Shift: signed ±32 righe (status[61:56]). line_tick = fine linea.
 wire line_tick = ce_pix && (timing_hpos == 10'(H_TOTAL_RD - 1));
 reg signed [5:0] osd_vga_vshift_d;
-always @(posedge clk_sys) if (line_tick) osd_vga_vshift_d <= $signed(status[61:56]);
-wire [8:0] vshift_tap = osd_vga_vshift_d[5]
-	? (9'(V_TOTAL_RD) + {{3{osd_vga_vshift_d[5]}}, osd_vga_vshift_d})
-	: {3'd0, osd_vga_vshift_d};
-reg [V_TOTAL_RD-1:0] vsync_line_shreg;
-always @(posedge clk_sys) if (line_tick) vsync_line_shreg <= {vsync_line_shreg[V_TOTAL_RD-2:0], VSync};
-reg vga_vs_reg;
-always @(posedge clk_sys) if (line_tick)
-	vga_vs_reg <= (vshift_tap == 9'd0) ? VSync : vsync_line_shreg[vshift_tap - 9'd1];
+always @(posedge clk_sys) if (line_tick) osd_vga_vshift_d <= crt_adj_on ? $signed(status[61:56]) : 6'sd0;
+// Lo shift register verticale fatto a mano NON serve piu': lo esegue il modulo
+// aggiornato tramite la porta `voffset`.
+
+// ─── CRT V-Size ─────────────────────────────────────────────────────────────
+// Stadio autonomo che sta A MONTE del resto: stira/comprime l'immagine in
+// verticale. Due modi, scelti dall'OSD: PVM ritempra le righe (nessuna riga
+// ripetuta o fusa: nitidezza nativa, ma l'HSync si sposta e serve un monitor
+// che lo segua) e Cabinet mantiene i tempi nativi (sync immobile, in cambio una
+// lievissima morbidezza). NB: il PVM funziona SOLO se la finestra DE non ha
+// agganci ai contatori nativi — vedi il commento su de_osd piu' avanti.
+// Il modulo si auto-misura il frame e resta in bypass finche' non ha due frame
+// stabili, quindi l'accensione e' pulita. A V-Size 0 (default) e' bypass puro.
+// Nota sull'ancoraggio: l'ingrandimento cresce verso il BASSO dal bordo
+// superiore nativo — per questo il confine verticale della finestra DE piu'
+// avanti viene preso dal blank RIGENERATO e non da quello nativo.
+// Un passo OSD = 3 righe; la negazione fa si' che "+" per l'utente = piu' alta.
+reg signed [5:0] crt_vsize;
+reg              crt_vsmode;
+wire signed [5:0] crt_vsz_step = $signed({{2{status[116]}}, status[116:113]});  // ESTESO CON SEGNO: il campo OSD e' a complemento a due (14 = -2, non +14)
+always @(posedge clk_sys) if (ce_pix) begin
+	crt_vsize  <= crt_adj_on ? -(crt_vsz_step + (crt_vsz_step <<< 1)) : 6'sd0;
+	crt_vsmode <= status[117];
+end
+wire [7:0] vz_r, vz_g, vz_b;
+wire       vz_hs, vz_vs, vz_de, vz_vb, vz_ce;
+crt_vsize #(
+	// Con il modo PVM disponibile serve RING_LINES >= |vsize|*2 + 4: la scala
+	// arriva a 24 righe (voce -8), quindi 52. (Per il solo Cabinet ne bastavano
+	// 28.) Costo: ~150 Kbit di M10K in piu' rispetto a 32.
+	.RING_LINES (52),
+	.LINE_PX    (H_TOTAL_RD)
+) u_crt_vsize (
+	.clk       (clk_sys),
+	.pxl_cen   (ce_pix),
+	.active    (crt_adj_on),
+	// 0 = PVM (retimer di riga: nessuna riga ripetuta o fusa, nitidezza nativa,
+	//     ma l'HSync si sposta ~0.4% per riga -> serve un monitor ad aggancio
+	//     largo). 1 = Cabinet (tempi nativi, sync immobile, lieve morbidezza).
+	.tube_mode (crt_vsmode),
+	.vsize     (crt_vsize),
+	.r_in      (av_r), .g_in (av_g), .b_in (av_b),
+	.hs_in     (HSync),
+	.vs_in     (VSync),
+	.de_in     (~(HBlank | VBlank)),
+	.vb_in     (VBlank),                 // VBlank VERO, mai il blank combinato
+	.r_out     (vz_r), .g_out (vz_g), .b_out (vz_b),
+	.hs_out    (vz_hs),
+	.vs_out    (vz_vs),
+	.de_out    (vz_de),
+	.vb_out    (vz_vb),
+	.ce_out    (vz_ce)
+);
 
 // Read rate a QUARTI di ciclo (step 1.56%): accumulatore in unita' di quarto.
 // Periodo pixel = (64 + hsize) quarti = (16 + hsize/4) cicli. hsize±1 = ±0.25
 // ciclo = step molto fine. Reset all'HSync → pattern DETERMINISTICO per riga
 // (identico ogni frame) → niente shimmer dinamico (irregolarita' statica minima,
 // 1 pixel su 4 di 1px per il livello ±1, invisibile).
-reg  vga_hs_reg_d;
-always @(posedge clk_sys) vga_hs_reg_d <= vga_hs_reg;
-wire shifted_hs_rise = vga_hs_reg & ~vga_hs_reg_d;
-wire [7:0] rd_period = 8'd64 + {{3{hsize_s[4]}}, hsize_s};  // quarti, hsize -16..+15 → 48..79
+// REGOLA CHIAVE del modulo: il generatore del clock enable di lettura si
+// resetta sul fronte di `hs_ref_out` del modulo, MAI sull'HSync grezzo. E'
+// quello che tiene scrittura, contatore interno di lettura e ritmo esterno
+// agganciati allo STESSO fronte; resettare sull'HSync fa derivare di fase lo
+// shrink e desincronizza (era il difetto dello schema vecchio).
+wire hs_ref;
+reg  hs_ref_d;
+always @(posedge clk_sys) hs_ref_d <= hs_ref;
+wire hs_ref_rise = hs_ref & ~hs_ref_d;
+// Base del generatore di lettura = rapporto clk/pixel in QUARTI di ciclo:
+// 80 MHz / 5 MHz = 16 cicli per pixel -> 64 quarti, cioe' passo 1/64 = 1.56%.
+// (ricetta ufficiale del modulo: la base si dimensiona sul PROPRIO rapporto)
+wire [7:0] rd_period = 8'd64 + {{3{hsize_s[4]}}, hsize_s};   // -16..+15 -> 48..79 quarti
 reg  [7:0] rd_acc;
 wire rd_tick = (rd_acc + 8'd4) >= {1'b0, rd_period};
 always @(posedge clk_sys) begin
-	if (shifted_hs_rise)  rd_acc <= 8'd0;
-	else if (rd_tick)     rd_acc <= rd_acc + 8'd4 - {1'b0, rd_period};  // sottrai periodo, tieni resto
-	else                  rd_acc <= rd_acc + 8'd4;                      // +4 quarti = 1 ciclo
+	if      (hs_ref_rise) rd_acc <= 8'd0;
+	else if (rd_tick)     rd_acc <= rd_acc + 8'd4 - {1'b0, rd_period};
+	else                  rd_acc <= rd_acc + 8'd4;
 end
-wire rd_ce = (hsize_s == 5'sd0) ? ce_pix : rd_tick;
+wire rd_ce = (hsize_s == 5'sd0) ? vz_ce : rd_tick;   // base = CE del V-Size
 
 wire [7:0] str_r, str_g, str_b;
 wire       str_hs, str_vs, str_hb, str_vb;
-analog_hsize u_analog_hsize (
+// Modulo CRT Adjust aggiornato (repo MiSTer-CRT-Adjust): stessa funzione di
+// prima piu' `active` (bypass vero da spento) e `voffset` (lo spostamento
+// verticale, che prima facevamo a mano con uno shift register). Riceve il
+// flusso GIA' passato dal V-Size, compreso il suo clock enable e il suo VBlank
+// rigenerato — regola d'oro dell'integrazione: ogni stadio che allunga o
+// accorcia la finestra verticale deve passare il PROPRIO vb, mai quello nativo.
+crt_adjust #(
+	.VTOTAL    (V_TOTAL_RD),
+	.HTOTAL    (H_TOTAL_RD),
+	// CONTENTSHIFT (1): sposta il CONTENUTO nel line buffer, lasciando l'HSync
+	// nativo byte per byte. E' quello che Raiden ha sempre usato e che funziona;
+	// SYNCSHIFT muove il sync ed e' il meccanismo che qui desincronizza.
+	.HPOS_MODE (1)
+) u_crt_adjust (
 	.clk      (clk_sys),
-	.pxl_cen  (ce_pix),
+	.pxl_cen  (vz_ce),
 	.pxl2_cen (rd_ce),
+	.active   (crt_adj_on),
 	.hsize    (hsize_s),
 	.hoffset  (hsize_hoffset),
-	.r_in     (av_r), .g_in (av_g), .b_in (av_b),
-	.hs_in    (vga_hs_reg),
-	.vs_in    (vga_vs_reg),
-	.hb_in    (HBlank | VBlank),
-	.vb_in    (VBlank),
+	.voffset  (osd_vga_vshift_d),
+	.r_in     (vz_r), .g_in (vz_g), .b_in (vz_b),
+	.hs_in    (vz_hs),
+	.vs_in    (vz_vs),
+	.hb_in    (~vz_de),
+	.vb_in    (vz_vb),
 	.r_out    (str_r), .g_out (str_g), .b_out (str_b),
 	.hs_out   (str_hs), .vs_out (str_vs),
-	.hb_out   (str_hb), .vb_out (str_vb)
+	.hb_out   (str_hb), .vb_out (str_vb),
+	.hs_ref_out (hs_ref)      // -> resetta il generatore di lettura (regola chiave)
 );
 
-// Finestra DE per l'OSD: apre all'attivo nativo (ritardato 1 riga), chiude a
-// larghezza stretchata piena (pattern Blood Bros).
-reg vblank_1l;
-always @(posedge clk_sys) if (line_tick) vblank_1l <= VBlank;
-wire native_active = ~(HBlank | vblank_1l);
-reg  native_active_d;
-always @(posedge clk_sys) if (ce_pix) native_active_d <= native_active;
-wire native_rise = native_active & ~native_active_d;
-wire str_active = ~str_hb;
-reg  str_active_d;
-always @(posedge clk_sys) if (rd_ce) str_active_d <= str_active;
-wire str_fall = str_active_d & ~str_active;
-reg de_osd;
-always @(posedge clk_sys) begin
-	if      (native_rise) de_osd <= 1'b1;
-	else if (str_fall)    de_osd <= 1'b0;
-end
+// Finestra DE dell'OSD: il fronte di salita va ancorato all'ATTIVO NATIVO e la
+// discesa segue la larghezza stretchata — e' lo schema prescritto dalla
+// documentazione del modulo. (Avevo provato ad ancorarlo all'uscita del V-Size:
+// sbagliato, la regola 1.9 riguarda gli ingressi degli STADI, non questa
+// finestra, e con quella variante il DE non si apre -> schermo nero.)
+// Finestra DE presa INTERAMENTE dalle uscite del modulo: nessun aggancio ai
+// contatori nativi. E' la differenza fra un'integrazione che regge il modo PVM e
+// una che no — in Cabinet il difetto non si vede perche' i tempi di riga restano
+// nativi, ma in PVM le righe sono ritemprate e un riferimento nativo non
+// corrisponde piu' a nulla: lo schermo va nero per costruzione, non per
+// sfortuna. Stessa forma usata dalle integrazioni che funzionano
+// (DenjinMakai, Seibu Cup, Rainbow).
+wire de_osd = ~str_hb & ~str_vb;
 
 // Output analogico: H-Size attivo → dal modulo (incorpora shift); bypass → shiftato.
-assign VGA_R  = hsize_active ? str_r  : av_r;
-assign VGA_G  = hsize_active ? str_g  : av_g;
-assign VGA_B  = hsize_active ? str_b  : av_b;
-assign VGA_HS = hsize_active ? str_hs : vga_hs_reg;
-assign VGA_VS = hsize_active ? str_vs : vga_vs_reg;
-assign CE_PIXEL = hsize_active ? rd_ce : ce_pix;
+// ─── GAMMA CORRECTION (gamma_fast) ───────────────────────────────────────
+// Il core non usa video_mixer, quindi la gamma va agganciata a mano: `gamma_bus`
+// era scollegata e nessun correttore era istanziato -> la voce OSD non faceva
+// nulla.
+// Usato gamma_fast e NON gamma_corr: prende `gamma_bus` come inout e lo
+// decodifica da solo (niente spacchettamento a mano, che avevo sbagliato di un
+// bit), ha tre LUT parallele lette in un colpo invece della sequenza a 3 cicli,
+// e ha gia' DE in ingresso e in uscita, che e' quello che serve qui.
+// Sta DOPO il mux CRT Adjust, cosi' i due rami (modulo CRT `str_*` e percorso
+// diretto `av_*`) prendono lo stesso ritardo. RGB e sync escono ritardati
+// INSIEME, quindi la posizione dell'immagine rispetto al sync non cambia.
+// Il selettore ora e' CRT Adjust On/Off, non piu' "H-Size diverso da zero":
+// i moduli aggiornati hanno il bypass vero al loro interno (`active`), ma da
+// spenti conviene comunque scavalcarli del tutto e prendere il flusso nativo,
+// cosi' l'immagine e' identica al core intoccato — bit per bit e senza latenza.
+wire [7:0] vid_r_pre  = crt_adj_on ? str_r  : av_r;
+wire [7:0] vid_g_pre  = crt_adj_on ? str_g  : av_g;
+wire [7:0] vid_b_pre  = crt_adj_on ? str_b  : av_b;
+wire       vid_hs_pre = crt_adj_on ? str_hs : HSync;
+wire       vid_vs_pre = crt_adj_on ? str_vs : VSync;
+// DE dal MODULO (hb_out), non piu' dalla finestra ricostruita a mano sui tempi
+// nativi: con il V-Size attivo la finestra verticale cambia, e usare quella
+// nativa tagliava parte dell'immagine quando si comprime.
+// Finestra DE secondo lo schema ufficiale: si apre sull'attivo (dallo stadio
+// V-Size) e si chiude a larghezza stretchata piena.
+// L'estensione VERTICALE deve venire dal blank RIGENERATO dal modulo, non da
+// quello nativo: l'ingrandimento cresce verso il basso e quelle righe cadono
+// dove il quadro originale e' gia' in blanking. Mascherandole col VBlank nativo
+// venivano spente -> "mangia in basso" (regola 1.2: le righe extra spente a
+// valle). L'ancoraggio ORIZZONTALE resta il nativo, come prescritto.
+wire       vid_de_pre = crt_adj_on ? de_osd : ~(HBlank | VBlank);
+wire       vid_ce_pix = crt_adj_on ? rd_ce  : ce_pix;
+
+wire [23:0] vid_rgb_out;
+wire        vid_hs_out, vid_vs_out, vid_de_out;
+gamma_fast u_gamma (
+	.clk_vid   (clk_sys),
+	.ce_pix    (vid_ce_pix),
+	.gamma_bus (gamma_bus),
+	.HSync     (vid_hs_pre),
+	.VSync     (vid_vs_pre),
+	.HBlank    (~vid_de_pre),
+	.VBlank    (1'b0),
+	.DE        (vid_de_pre),
+	.RGB_in    ({vid_r_pre, vid_g_pre, vid_b_pre}),
+	.HSync_out (vid_hs_out),
+	.VSync_out (vid_vs_out),
+	.HBlank_out(),
+	.VBlank_out(),
+	.DE_out    (vid_de_out),
+	.RGB_out   (vid_rgb_out)
+);
+
+assign VGA_R  = vid_rgb_out[23:16];
+assign VGA_G  = vid_rgb_out[15:8];
+assign VGA_B  = vid_rgb_out[7:0];
+assign VGA_HS = vid_hs_out;
+assign VGA_VS = vid_vs_out;
+assign CE_PIXEL = vid_ce_pix;
 
 // Aspect ratio: Original = 4:3 arcade display, Full Screen = 0:0.
 // Quando ruota (TATE) swap ARX/ARY: la scena è già ruotata dal framebuffer
@@ -1441,14 +1799,14 @@ wire [11:0] ary = (!ar) ? (rotate_en ? 12'd4 : 12'd3) : 12'd0;
 video_freak video_freak
 (
 	.CLK_VIDEO(clk_sys),
-	.CE_PIXEL(hsize_active ? rd_ce : ce_pix),
+	.CE_PIXEL(crt_adj_on ? rd_ce : ce_pix),
 	.VGA_VS(VSync),
 	.HDMI_WIDTH(HDMI_WIDTH),
 	.HDMI_HEIGHT(HDMI_HEIGHT),
 	.VGA_DE(VGA_DE),
 	.VIDEO_ARX(VIDEO_ARX),
 	.VIDEO_ARY(VIDEO_ARY),
-	.VGA_DE_IN(hsize_active ? de_osd : ~(HBlank | VBlank)),
+	.VGA_DE_IN(vid_de_out),
 	.ARX(arx),
 	.ARY(ary),
 	.CROP_SIZE(12'd0),
@@ -1474,7 +1832,13 @@ wire rotate_ccw = (rotate_sel == 2'd1);
 wire flip_180   = status[3];
 wire video_rotated;
 
-assign VGA_SCALER = video_rotated;
+// VGA_SCALER deve restare 0: il CRT analogico non deve MAI cambiare routing
+// quando attivi rotate. La rotazione HDMI e' gestita da screen_rotate via
+// framebuffer HPS, NON tramite VGA_SCALER. Pattern gia' applicato in
+// SkySmasher (SkySmasher.sv:149-153) e mai portato qui: con VGA_SCALER
+// legato a video_rotated, abilitare la rotazione dirottava anche l'uscita
+// analogica.
+assign VGA_SCALER = 0;
 
 wire [28:0] rot_addr;
 wire [63:0] rot_data;
@@ -1484,7 +1848,7 @@ wire        rot_we;
 screen_rotate u_screen_rotate
 (
 	.CLK_VIDEO     (clk_sys),
-	.CE_PIXEL      (hsize_active ? rd_ce : ce_pix),
+	.CE_PIXEL      (crt_adj_on ? rd_ce : ce_pix),
 
 	.VGA_R         (VGA_R),
 	.VGA_G         (VGA_G),
@@ -1525,5 +1889,96 @@ raiden_rotate_fifo u_rot_fifo (
 	.rot_we   (rot_we),
 	.ddr      (ddr_rot)
 );
+
+`ifdef V30_SIM_PROBES
+// Probe MIXER: chi disegna il pixel (x,y) scelto? Stampa una riga per frame
+// con lo stato di TUTTI i layer nel punto = identifica il colpevole del blocco.
+integer dbg_px_n = 0;
+always @(posedge clk_sys) begin
+	if (ce_pix && video_de && dbg_px_n < 30 &&
+	    ((hpos_for_read == 10'd220 && vpos_for_pf == 9'd80) ||
+	     (hpos_for_read == 10'd180 && vpos_for_pf == 9'd140))) begin
+		dbg_px_n <= dbg_px_n + 1;
+		$display("[mix] x=%0d y=%0d | txt=%b(%03h) sprA=%b sprB=%b spr(op=%b pri=%0d pen=%03h) fg=%b(%03h) bg=%b(%03h)",
+		         hpos_for_read, vpos_for_pf, text_opaque, text_pen,
+		         spr_above_fg, spr_above_bg, spr_opaque, spr_pri, spr_pen,
+		         fg_opaque, fg_pen, bg_opaque, bg_pen);
+	end
+end
+`endif
+
+`ifdef V30_SIM_PROBES
+// Probe savestate (scene): comando OSD -> ss_ui -> manager -> DMA.
+reg dbg_ssl_p, dbg_ssb_p, dbg_ssmp_p;
+integer dbg_hb = 0;
+integer dbg_ss_dur = 0;
+integer dbg_mgr_dur = 0;
+integer dbg_gate_tr = 0;
+reg dbg_post_tr = 0;
+always @(posedge clk_sys) begin
+	dbg_ssl_p <= ss_load;
+	dbg_ssb_p <= ss_busy;
+	if (ss_load && !dbg_ssl_p)  $display("[ssui] ss_load EDGE (slot=%0d) status108=%b status107=%b", ss_slot, status[108], status[107]);
+	if (ss_mgr_pause && !dbg_ssmp_p) $display("[ssui] ss_mgr_pause ALTO");
+	dbg_ssmp_p <= ss_mgr_pause;
+	if (ss_mgr_pause && (dbg_hb % 500000) == 0)
+		$display("[ssui] wait: paused_safe=%b main_idle=%b sub_idle=%b z80_rdy=%b", paused_safe, main_cpu_idle, sub_cpu_idle, z80_ss_ready);
+	if (ss_busy && !dbg_ssb_p) dbg_gate_tr <= 40;
+	if (!ss_busy && dbg_ssb_p) dbg_post_tr <= 1;
+	if (dbg_post_tr && (dbg_hb % 200000) == 0)
+		$display("[sspost] mgr_pause=%b paused_safe=%b reload=%b main_idle=%b sub_idle=%b", ss_mgr_pause, paused_safe, ss_cpu_reload, main_cpu_idle, sub_cpu_idle);
+	if (dbg_gate_tr > 0) begin
+		dbg_gate_tr <= dbg_gate_tr - 1;
+		$display("[ssgate] t-%0d hold=%b grant=%b infl=%b rd=%b addr=%h rdy=%b rdata=%h", dbg_gate_tr, ss_hold, ss_ddr_grant, ss_tx_inflight, ddr_ss.read, ddr_ss.addr, ddr_ss.rdata_ready, ddr_ss.rdata[31:0]);
+	end
+	dbg_hb <= dbg_hb + 1;
+	if (ss_save)                $display("[ssui] ss_save alto!");
+	if (ss_busy != dbg_ssb_p)   $display("[ssui] ss_busy=%b", ss_busy);
+	// durata di ogni operazione SS: un save che non si chiude non stampa mai
+	if (ss_busy && !dbg_ssb_p) dbg_ss_dur <= 0;
+	else if (ss_busy) dbg_ss_dur <= dbg_ss_dur + 1;
+	else if (!ss_busy && dbg_ssb_p) $display("[ssdur] operazione SS completata in %0d clk", dbg_ss_dur);
+	// watchdog: se il manager tiene la pausa troppo a lungo = DEADLOCK
+	if (ss_mgr_pause) dbg_mgr_dur <= dbg_mgr_dur + 1;
+	else dbg_mgr_dur <= 0;
+	if (dbg_mgr_dur == 32'd4000000)
+		$display("[SSDEADLOCK] pausa SS bloccata >4M clk: paused_safe=%b main_idle=%b sub_idle=%b z80=%b busy=%b",
+		         paused_safe, main_cpu_idle, sub_cpu_idle, z80_ss_ready, ss_busy);
+end
+`endif
+
+`ifdef V30_SIM_PROBES
+// Probe boot-gate (switch --define V30_SIM_PROBES=1): catena main ROM CPU->cache->bridge->porta1 SDRAM.
+integer dbg_mr_ev = 0;
+reg dbg_gmr_p, dbg_bmr_p, dbg_r1_p, dbg_a1_p;
+always @(posedge clk_sys) begin
+	dbg_gmr_p <= game_main_req;
+	dbg_bmr_p <= bridge_main_req;
+	dbg_r1_p  <= sd_req1;
+	dbg_a1_p  <= sd_ack1;
+	if (dbg_mr_ev < 80) begin
+		if (game_main_req != dbg_gmr_p) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] game_req=%b addr=%h (sdram_ready=%b)", game_main_req, game_main_addr, sdram_ready);
+		end
+		if (game_main_ready) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] game_READY data=%h addr=%h", game_main_data, game_main_addr);
+		end
+		if (bridge_main_req != dbg_bmr_p) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] bridge_req=%b addr=%h", bridge_main_req, bridge_main_addr);
+		end
+		if (bridge_main_ready) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] bridge_READY data=%h", bridge_main_data);
+		end
+		if (sd_req1 != dbg_r1_p || sd_ack1 != dbg_a1_p) begin
+			dbg_mr_ev <= dbg_mr_ev + 1;
+			$display("[mainrom] port1 req=%b ack=%b addr=%h", sd_req1, sd_ack1, sd_addr1);
+		end
+	end
+end
+`endif
 
 endmodule

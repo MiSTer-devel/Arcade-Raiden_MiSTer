@@ -4,13 +4,13 @@
 /*  This file is part of Raiden_MiSTer.
     GPL-3.
     Original author: Martin Donlon (wickerwaka) — Arcade-TaitoF2 savestate system.
-    Modified/adapted for BoogieWings by: Umberto Parisi (rmonc79)
+    Modified/adapted for Raiden by: Umberto Parisi (rmonic79)
 */
 
 //============================================================================
-//  BoogieWings Savestate — adaptor per le RAM inferite inline
+//  Raiden Savestate — adaptor per le RAM inferite inline
 //
-//  Le RAM di BoogieWings sono `reg [7:0] mem[0:N]` con porta CPU separata in
+//  Le RAM del core sono `reg [7:0] mem[0:N]` con porta CPU separata in
 //  byte (lo/hi). L'adaptor si interpone IN SERIE sulle linee della porta:
 //  in modo normale passa i segnali del gioco; quando il ssbus accede a SS_IDX,
 //  dirotta la porta verso il bus savestate (read/write).
@@ -18,8 +18,9 @@
 //
 //  Riferimento: _reference/taitof2_ss/ram.sv (ram_ss_adaptor / m68k_ram_ss_adaptor)
 //
-//  Variante "byte-pair" (lo+hi a 16 bit, indirizzo word) per le RAM tipiche del
-//  68K di BoogieWings: ram_lo/ram_hi, pf*_vram_lo/hi, sprite, palette, mirror.
+//  Variante "byte-pair" (lo+hi a 16 bit, indirizzo word) per le RAM a 16 bit
+//  delle due V30: work RAM main e sub, RAM condivisa, spriteram, text, bg/fg,
+//  palette.
 //============================================================================
 
 `timescale 1ns / 1ps

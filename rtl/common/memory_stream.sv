@@ -4,11 +4,11 @@
 /*  This file is part of Raiden_MiSTer.
     GPL-3.
     Original author: Martin Donlon (wickerwaka) — Arcade-TaitoF2 savestate system.
-    Modified/adapted for BoogieWings by: Umberto Parisi (rmonc79)
+    Modified/adapted for Raiden by: Umberto Parisi (rmonic79)
 */
 
 //============================================================================
-//  BoogieWings Savestate — memory_stream (DMA streaming verso DDR)
+//  Raiden Savestate — memory_stream (DMA streaming verso DDR)
 //  Portato fedele da _reference/taitof2_ss/memory_stream.sv (Martin Donlon).
 //  Hardware-agnostico: dipende solo da ddr_if. Non modificato.
 //============================================================================
@@ -39,7 +39,12 @@ module memory_stream #(parameter COUNT = 16)
     output reg [31:0]   chunk_address,
     output      [7:0]   chunk_select,
 
-    output              busy
+    output              busy,
+    // [FIX slot vuoto] 1 = l'ultimo LOAD ha trovato un header sotto-slot NON
+    // valido (magic assente): sotto-slot mai scritto -> nessuno scatter fatto.
+    // Latchato fino al load successivo; il gestore lo usa per NON rilanciare le
+    // CPU dopo un caricamento a vuoto (era quello che rompeva il gioco).
+    output reg          slot_empty
 );
 
     typedef enum
@@ -109,6 +114,7 @@ module memory_stream #(parameter COUNT = 16)
             query_req <= 0;
             chunk_index <= 0;
             is_reading <= 0;
+            slot_empty <= 0;   // [FIX slot vuoto]
         end
         else begin
             case (state)
@@ -133,6 +139,7 @@ module memory_stream #(parameter COUNT = 16)
                         state <= READ_HEADER;
                         is_reading <= 1;
                         ddr.acquire <= 1;
+                        slot_empty <= 0;   // [FIX slot vuoto] nuovo load: reset flag
                     end else if (write_start) begin
                         state <= READ_HEADER;
                         is_reading <= 0;
@@ -155,8 +162,22 @@ module memory_stream #(parameter COUNT = 16)
                             header_data <= ddr.rdata;
 
                             if (is_reading) begin
-                                end_addr <= current_addr + { ddr.rdata[61:32], 2'b00 };
-                                state <= READ_MEM_REQ;
+                                // [FIX slot vuoto] valida l'header del sotto-slot:
+                                //  - magic bit[63:62]==2'b11 (lo scrive il save; un
+                                //    sotto-slot mai scritto ha residui -> quasi mai 11)
+                                //  - size in [1 .. length/4] (range plausibile)
+                                // Se INVALIDO: nessuno scatter, torna a IDLE e alza
+                                // slot_empty -> il gestore non rilancia le CPU.
+                                if ( (ddr.rdata[63:62] == 2'b11) &&
+                                     (ddr.rdata[61:32] != 30'd0) &&
+                                     (ddr.rdata[61:32] <= length[31:2]) ) begin
+                                    end_addr <= current_addr + { ddr.rdata[61:32], 2'b00 };
+                                    state <= READ_MEM_REQ;
+                                end else begin
+                                    slot_empty  <= 1'b1;
+                                    ddr.acquire <= 1'b0;
+                                    state       <= IDLE;
+                                end
                             end else begin
                                 state <= QUERY_GATHER_FIRST;
                             end
@@ -170,7 +191,10 @@ module memory_stream #(parameter COUNT = 16)
                         ddr.write <= 1;
                         ddr.addr <= start_addr;
                         len = current_addr - (start_addr + 32'd8);
-                        ddr.wdata[63:32] <= { 2'b00, len[31:2] };
+                        // [FIX slot vuoto] magic 2'b11 nei bit alti (prima 2'b00):
+                        // marca il sotto-slot come SCRITTO, cosi' il load distingue
+                        // uno slot vero da uno mai usato.
+                        ddr.wdata[63:32] <= { 2'b11, len[31:2] };
                         ddr.wdata[31:0] <= header_data[31:0] + 32'd1;
                         state <= WRITE_HEADER_WAIT;
                     end
@@ -459,6 +483,20 @@ module memory_stream #(parameter COUNT = 16)
             endcase
         end
     end
+
+`ifdef V30_SIM_PROBES
+// Traccia il ripristino: header letto, indirizzi, e ogni cambio di stato.
+reg [4:0] dbg_st_d;
+integer dbg_ms = 0;
+always @(posedge clk) begin
+	dbg_st_d <= state;
+	if (state != dbg_st_d && dbg_ms < 40) begin
+		dbg_ms <= dbg_ms + 1;
+		$display("[ms] stato %0d -> %0d  cur=%08h end=%08h hdr=%016h rd=%b",
+		         dbg_st_d, state, current_addr, end_addr, header_data, is_reading);
+	end
+end
+`endif
 
 endmodule
 
